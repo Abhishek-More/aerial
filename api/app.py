@@ -123,11 +123,16 @@ def append_log(entry: dict):
 
 def parse_class_datetime(class_date: str, time_str: str) -> datetime | None:
     """Parse class_date (M/D/YYYY) and time (e.g. '9:30 am EDT') into a datetime."""
+    if not class_date or not time_str:
+        print(f"[parse] Empty date='{class_date}' or time='{time_str}'")
+        return None
     try:
         time_clean = re.sub(r"[\xa0\s]+", " ", time_str).strip()
         time_clean = re.sub(r"\s+[A-Z]{2,4}$", "", time_clean).strip()
-        return datetime.strptime(f"{class_date} {time_clean}", "%m/%d/%Y %I:%M %p")
-    except (ValueError, TypeError):
+        result = datetime.strptime(f"{class_date} {time_clean}", "%m/%d/%Y %I:%M %p")
+        return result
+    except (ValueError, TypeError) as e:
+        print(f"[parse] Failed to parse date='{class_date}' time='{time_str}': {e}")
         return None
 
 

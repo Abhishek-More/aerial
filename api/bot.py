@@ -228,7 +228,8 @@ def parse_classes(html: str) -> list[dict]:
         if "header" in (element.get("class") or []):
             current_date = element.get_text(strip=True)
             # Parse "TueMay 26, 2026" or "Tue May 26, 2026" into M/D/YYYY
-            date_match = re.search(r"(\w+)\s+(\d+),\s*(\d{4})", current_date)
+            # The month name may be glued to the day abbreviation (e.g. "FriMay")
+            date_match = re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d+),\s*(\d{4})", current_date)
             if date_match:
                 from datetime import datetime as _dt
                 try:
