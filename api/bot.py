@@ -2,7 +2,10 @@ import re
 import os
 import json
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://clients.mindbodyonline.com"
 _DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
@@ -162,7 +165,8 @@ def get_session() -> requests.Session:
     proxy_url = os.environ.get("PROXY_URL", "")
     if proxy_url:
         session.proxies = {"http": proxy_url, "https": proxy_url}
-        print(f"[get_session] Using proxy for requests")
+        session.verify = False
+        print(f"[get_session] Using proxy for requests (SSL verify disabled)")
 
     # Try 1: Load saved cookie jar from last successful session
     print("[get_session] Try 1: Loading saved cookie jar...")
