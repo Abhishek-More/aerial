@@ -83,7 +83,13 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
         print(f"[login] Page loaded. URL: {page.url}")
         print(f"[login] Page title: {page.title()}")
 
-        # Step 2: Fill in login form and submit via the actual form POST
+        # If we landed on /classic/home instead of /ASP/su1.asp, navigate to the login page
+        if "/classic/home" in page.url or "su1.asp" not in page.url:
+            print("[login] Landed on different page, navigating to login page...")
+            page.goto(f"{BASE_URL}/ASP/su1.asp?studioid=836167", wait_until="networkidle", timeout=30000)
+            print(f"[login] Login page URL: {page.url}")
+
+        # Step 2: Fill in login form
         print("[login] Waiting for login form (#su1UserName)...")
         page.wait_for_selector("#su1UserName", timeout=30000)
         print("[login] Login form found. Filling credentials...")
@@ -165,13 +171,8 @@ def get_session() -> requests.Session:
     proxy_url = os.environ.get("PROXY_URL", "")
     if proxy_url:
         session.proxies = {"http": proxy_url, "https": proxy_url}
-        cert_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "BrightData SSL certificate (port 33335).crt")
-        if os.path.exists(cert_path):
-            session.verify = cert_path
-            print(f"[get_session] Using proxy with Bright Data cert")
-        else:
-            session.verify = False
-            print(f"[get_session] Using proxy (SSL verify disabled, cert not found)")
+        session.verify = False
+        print(f"[get_session] Using proxy for requests")
 
     # Try 1: Load saved cookie jar from last successful session
     print("[get_session] Try 1: Loading saved cookie jar...")
