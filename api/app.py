@@ -433,7 +433,7 @@ def api_unwatch():
 
 @app.route("/api/book", methods=["POST"])
 def api_book():
-    """Immediately book a class."""
+    """Immediately book a class. Re-auths automatically if session expired."""
     data = request.json
     class_id = data.get("class_id")
     class_date = data.get("class_date")
@@ -443,6 +443,14 @@ def api_book():
     session = get_bot_session()
     try:
         result = signup_for_class(session, class_id, class_date)
+
+        # If session expired, re-auth and retry once
+        if "session expired" in result.lower():
+            print("[api_book] Session expired, re-authing and retrying...")
+            force_reauth()
+            session = get_bot_session()
+            result = signup_for_class(session, class_id, class_date)
+
         append_log({
             "time": datetime.now().isoformat(),
             "action": "manual_book",

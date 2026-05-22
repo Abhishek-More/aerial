@@ -70,25 +70,36 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
         page.fill("#su1UserName", email)
         page.fill("#su1Password", password)
 
-        # Click login and wait for it to process
+        # Click login and wait for auth cookies to appear
         print("[login] Clicking login button...")
         page.click("#btnSu1Login")
 
-        # Give login time to process — wait a bit then grab cookies
-        print("[login] Waiting for login to process...")
-        page.wait_for_timeout(5000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
+        # Wait for the idsrvauth cookie — this is the real auth token
+        # The login JS triggers an Identity/OAuth flow that may take time
+        print("[login] Waiting for auth cookies (idsrvauth)...")
+        max_wait = 45  # seconds
+        for i in range(max_wait):
+            page.wait_for_timeout(1000)
+            cookies_now = context.cookies()
+            cookie_names_now = [c["name"] for c in cookies_now]
+            if "idsrvauth" in cookie_names_now:
+                print(f"[login] Got idsrvauth after {i+1}s!")
+                break
+            if i % 5 == 4:
+                print(f"[login] Still waiting... ({i+1}s) cookies: {cookie_names_now}")
+                print(f"[login] Current URL: {page.url}")
+        else:
+            print(f"[login] WARNING: idsrvauth not found after {max_wait}s")
 
         print(f"[login] Post-login URL: {page.url}")
 
-        # Grab cookies immediately — no further navigation needed
+        # Grab all cookies
         browser_cookies = context.cookies()
         print(f"[login] Extracted {len(browser_cookies)} cookies")
         cookie_names = [c["name"] for c in browser_cookies]
         print(f"[login] Cookie names: {cookie_names}")
+        has_auth = "idsrvauth" in cookie_names
+        print(f"[login] Has idsrvauth: {has_auth}")
 
         browser.close()
 
