@@ -259,11 +259,12 @@ def api_log():
     return jsonify(load_log())
 
 
-if __name__ == "__main__":
-    # Start the scheduler — checks every 30 seconds
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(check_and_book, "interval", seconds=30, id="check_and_book")
-    scheduler.start()
-    print("Scheduler started — checking watchlist every 30 seconds")
+# Start the scheduler at import time (works with both gunicorn and direct run)
+scheduler = BackgroundScheduler()
+scheduler.add_job(check_and_book, "interval", seconds=30, id="check_and_book")
+scheduler.start()
+print("Scheduler started — checking watchlist every 30 seconds")
 
-    app.run(debug=False, port=5050)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5050))
+    app.run(debug=False, host="0.0.0.0", port=port)
