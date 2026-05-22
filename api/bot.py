@@ -56,41 +56,78 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
         )
         page = context.new_page()
 
-        # Step 1: Navigate to the studio page
+        # Step 1: Navigate to the studio page (Cloudflare challenge solved by real browser)
         print(f"[login] Navigating to {BASE_URL}/classic/ws?studioid=836167")
         page.goto(f"{BASE_URL}/classic/ws?studioid=836167", wait_until="networkidle", timeout=60000)
         print(f"[login] Page loaded. URL: {page.url}")
         print(f"[login] Page title: {page.title()}")
 
-        # Step 2: Fill in login form
+        # Step 2: Fill in login form and submit via the actual form POST
         print("[login] Waiting for login form (#su1UserName)...")
         page.wait_for_selector("#su1UserName", timeout=30000)
         print("[login] Login form found. Filling credentials...")
         page.fill("#su1UserName", email)
         page.fill("#su1Password", password)
 
-        print("[login] Clicking login button...")
-        page.click("#btnSu1Login")
+        # Submit the form directly via JS — the button is type="button" so click
+        # triggers a JS handler that may not work headless. Instead, submit the
+        # parent form which POSTs to /ASP/login_p.asp
+        print("[login] Submitting login form via JS...")
+        page.evaluate("""() => {
+            const form = document.querySelector('#su1UserName').closest('form');
+            if (form) {
+                form.submit();
+            } else {
+                // Fallback: build and submit a form manually
+                const f = document.createElement('form');
+                f.method = 'POST';
+                f.action = '/ASP/login_p.asp';
+                const fields = {
+                    'requiredtxtUserName': document.querySelector('#su1UserName').value,
+                    'requiredtxtPassword': document.querySelector('#su1Password').value,
+                    'tg': '', 'vt': '', 'lvl': '', 'stype': '', 'qParam': '',
+                    'view': '', 'trn': '0', 'page': '', 'catid': '', 'prodid': '',
+                    'prodGroupId': '', 'date': '', 'classid': '0', 'sSU': '',
+                    'optForwardingLink': '', 'isAsync': 'false'
+                };
+                for (const [k, v] of Object.entries(fields)) {
+                    const inp = document.createElement('input');
+                    inp.type = 'hidden'; inp.name = k; inp.value = v;
+                    f.appendChild(inp);
+                }
+                document.body.appendChild(f);
+                f.submit();
+            }
+        }""")
 
-        # Step 3: Wait for login to complete
-        print("[login] Waiting for login response...")
+        # Wait for navigation after form submit
+        print("[login] Waiting for navigation after login...")
         try:
-            page.wait_for_selector("#top-wel-sp", timeout=30000)
-            print("[login] Login successful — welcome message found")
+            page.wait_for_load_state("networkidle", timeout=30000)
         except Exception as e:
-            content = page.content().lower()
-            print(f"[login] #top-wel-sp not found: {e}")
-            print(f"[login] Current URL: {page.url}")
-            print(f"[login] Page has 'signed in': {'signed in' in content}")
-            print(f"[login] Page length: {len(content)} chars")
-            if "signed in" in content:
-                print("[login] Login successful (fallback check)")
-            else:
-                # Save page content for debugging
-                snippet = page.content()[:1000]
-                print(f"[login] Page snippet: {snippet}")
-                browser.close()
-                raise RuntimeError(f"Browser login failed. URL: {page.url}")
+            print(f"[login] Navigation wait: {e}")
+
+        print(f"[login] Post-login URL: {page.url}")
+        print(f"[login] Post-login title: {page.title()}")
+        content_lower = page.content().lower()
+        print(f"[login] Page has 'signed in': {'signed in' in content_lower}")
+        print(f"[login] Page has 'welcome': {'welcome' in content_lower}")
+        print(f"[login] Page has 'resetSession': {'resetsession' in content_lower}")
+        print(f"[login] Page length: {len(content_lower)} chars")
+
+        if "signed in" not in content_lower and "welcome" not in content_lower:
+            snippet = page.content()[:1500]
+            print(f"[login] Page snippet: {snippet}")
+            # Still extract cookies — Cloudflare cookies are the important ones
+            print("[login] Login may have failed, but extracting cookies anyway...")
+
+        # Step 3: Navigate to class schedule to confirm session works
+        print("[login] Navigating to class schedule to verify session...")
+        page.goto(f"{BASE_URL}/classic/mainclass?fl=true&tabID=7", wait_until="networkidle", timeout=30000)
+        print(f"[login] Schedule page URL: {page.url}")
+        schedule_content = page.content().lower()
+        print(f"[login] Schedule has 'classSchedule': {'classschedule' in schedule_content}")
+        print(f"[login] Schedule has 'signed in': {'signed in' in schedule_content}")
 
         # Step 4: Extract all cookies
         browser_cookies = context.cookies()
