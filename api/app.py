@@ -9,7 +9,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from flask import Flask, jsonify, render_template, request
 
-from bot import get_classes, get_session, signup_for_class, login_with_playwright, get_credentials, apply_cookies, save_cookie_jar, check_session, HEADERS
+from bot import get_classes, get_session, signup_for_class, get_cloudflare_cookies, login_with_requests, get_credentials, apply_cookies, save_cookie_jar, check_session, HEADERS
 
 app = Flask(__name__)
 
@@ -51,13 +51,17 @@ def force_reauth():
         _session = req.Session()
         _session.headers.update(HEADERS)
         email, password = get_credentials()
-        cookies = login_with_playwright(email, password)
-        apply_cookies(_session, cookies)
-        save_cookie_jar(_session)
-        if check_session(_session):
-            print("[reauth] Re-auth successful, session valid.")
+
+        # Step 1: Cloudflare bypass
+        cf_cookies = get_cloudflare_cookies()
+        apply_cookies(_session, cf_cookies)
+
+        # Step 2: Login via requests
+        if login_with_requests(_session, email, password):
+            save_cookie_jar(_session)
+            print("[reauth] Re-auth successful!")
         else:
-            print("[reauth] Re-auth done but session check failed!")
+            print("[reauth] Re-auth failed!")
 
 
 def get_cached_classes(date="", location="0", category="0", force=False):
