@@ -9,7 +9,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from flask import Flask, jsonify, render_template, request
 
-from bot import get_classes, get_session, signup_for_class, login_with_playwright, get_credentials, apply_cookies, save_cookie_jar, check_session, HEADERS
+from bot import get_classes, get_session, signup_for_class, login_with_playwright, get_credentials, apply_cookies, save_cookie_jar, check_session, HEADERS, COOKIE_JAR_FILE
 
 app = Flask(__name__)
 
@@ -53,7 +53,10 @@ def force_reauth():
         email, password = get_credentials()
         cookies = login_with_playwright(email, password)
         apply_cookies(_session, cookies)
-        save_cookie_jar(_session)
+        # Save cookie jar
+        import json as _json
+        with open(COOKIE_JAR_FILE, "w") as f:
+            _json.dump(cookies, f)
         has_auth = any(c.name == "idsrvauth" for c in _session.cookies)
         print(f"[reauth] Done. Has idsrvauth: {has_auth}")
 
