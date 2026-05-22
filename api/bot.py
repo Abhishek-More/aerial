@@ -165,8 +165,13 @@ def get_session() -> requests.Session:
     proxy_url = os.environ.get("PROXY_URL", "")
     if proxy_url:
         session.proxies = {"http": proxy_url, "https": proxy_url}
-        session.verify = False
-        print(f"[get_session] Using proxy for requests (SSL verify disabled)")
+        cert_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "BrightData SSL certificate (port 33335).crt")
+        if os.path.exists(cert_path):
+            session.verify = cert_path
+            print(f"[get_session] Using proxy with Bright Data cert")
+        else:
+            session.verify = False
+            print(f"[get_session] Using proxy (SSL verify disabled, cert not found)")
 
     # Try 1: Load saved cookie jar from last successful session
     print("[get_session] Try 1: Loading saved cookie jar...")
