@@ -327,9 +327,11 @@ def signup_for_class(session: requests.Session, class_id: str, class_date: str, 
       3. my_sch.asp   — confirmation page
     """
     # Step 1: Hit the reservation page
+    print(f"[book] Step 1: GET res_a.asp classId={class_id} classDate={class_date} tg={tg} clsLoc={cls_loc}")
     res_a_url = f"{BASE_URL}/ASP/res_a.asp"
     res_a_params = {"tg": tg, "classId": class_id, "classDate": class_date, "clsLoc": cls_loc}
     resp = session.get(res_a_url, params=res_a_params, timeout=30)
+    print(f"[book] Step 1 response: status={resp.status_code} length={len(resp.text)} url={resp.url}")
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -337,13 +339,20 @@ def signup_for_class(session: requests.Session, class_id: str, class_date: str, 
 
     # Check if class is full
     if "class is full" in page_text.lower():
+        print(f"[book] Class is full!")
         return f"Class {class_id} on {class_date} is FULL."
+
+    # Check for session issues
+    if "resetsession" in resp.text.lower():
+        print(f"[book] Session expired during booking!")
+        return f"Session expired. Please refresh and try again."
 
     # Step 2: Hit res_deb.asp to confirm the booking
     client_id = ""
     client_match = re.search(r"clientId=(\d+)", resp.text)
     if client_match:
         client_id = client_match.group(1)
+    print(f"[book] Extracted clientId={client_id}")
 
     res_deb_url = f"{BASE_URL}/ASP/res_deb.asp"
     res_deb_params = {
@@ -359,20 +368,28 @@ def signup_for_class(session: requests.Session, class_id: str, class_date: str, 
         "clientId": client_id,
         "enroll": "false",
     }
+    print(f"[book] Step 2: GET res_deb.asp params={res_deb_params}")
     resp2 = session.get(res_deb_url, params=res_deb_params, timeout=30)
+    print(f"[book] Step 2 response: status={resp2.status_code} length={len(resp2.text)} url={resp2.url}")
     resp2.raise_for_status()
 
     soup2 = BeautifulSoup(resp2.text, "html.parser")
     page_text2 = soup2.get_text()
 
     # Step 3: Check for confirmation
-    if "you've booked" in page_text2.lower() or "notifyBooking" in resp2.text:
+    has_booked = "you've booked" in page_text2.lower()
+    has_notify = "notifyBooking" in resp2.text
+    print(f"[book] Step 3: has_booked={has_booked} has_notify={has_notify}")
+
+    if has_booked or has_notify:
+        print(f"[book] SUCCESS! Booked class {class_id}")
         return f"Successfully booked class {class_id} on {class_date}!"
 
     # Sometimes res_deb redirects to my_sch.asp with confirmation
     sch_match = re.search(r"classSchIDs=([^&\"']+)", resp2.text)
     if sch_match:
         sch_ids = sch_match.group(1)
+        print(f"[book] Found classSchIDs={sch_ids}, following to my_sch.asp")
         my_sch_url = f"{BASE_URL}/ASP/my_sch.asp"
         my_sch_params = {
             "classSchIDs": sch_ids,
@@ -384,6 +401,7 @@ def signup_for_class(session: requests.Session, class_id: str, class_date: str, 
             "tabID": "2",
         }
         resp3 = session.get(my_sch_url, params=my_sch_params, timeout=30)
+        print(f"[book] my_sch response: status={resp3.status_code} length={len(resp3.text)}")
         resp3.raise_for_status()
         soup3 = BeautifulSoup(resp3.text, "html.parser")
         page_text3 = soup3.get_text()
@@ -391,13 +409,18 @@ def signup_for_class(session: requests.Session, class_id: str, class_date: str, 
         if "you've booked" in page_text3.lower():
             notify = soup3.find("div", id="notifyBooking")
             if notify:
+                print(f"[book] SUCCESS via my_sch: {notify.get_text(strip=True)}")
                 return notify.get_text(strip=True)
+            print(f"[book] SUCCESS via my_sch!")
             return f"Successfully booked class {class_id} on {class_date}!"
 
     if "full" in page_text2.lower() or "waitlist" in page_text2.lower():
+        print(f"[book] Class is full (detected in step 2)")
         return f"Class {class_id} on {class_date} is FULL."
 
-    return f"Booking may have failed. Response snippet: {page_text2[:300]}"
+    snippet = page_text2[:500]
+    print(f"[book] FAILED — unknown response. Snippet: {snippet}")
+    return f"Booking may have failed. Response snippet: {snippet}"
 
 
 if __name__ == "__main__":
