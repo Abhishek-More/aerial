@@ -114,7 +114,7 @@ def check_session(session: requests.Session) -> bool:
     try:
         resp = session.get(f"{BASE_URL}/classic/mainclass?fl=true&tabID=7", allow_redirects=False, timeout=15)
         print(f"[session] Status: {resp.status_code}, length: {len(resp.text)}")
-        has_reset = True 
+        has_reset = "resetSession" in resp.text
         has_schedule = "classSchedule" in resp.text
         print(f"[session] Has resetSession: {has_reset}, has classSchedule: {has_schedule}")
         if resp.status_code == 200 and not has_reset and has_schedule:
