@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import time as _time
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -17,6 +18,11 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "booking_log
 _session = None
 _session_lock = threading.Lock()
 
+# In-memory class cache — refreshed every 5 minutes by the scheduler
+_class_cache = {}  # key: (date, location, category) -> {"classes": [...], "fetched_at": float}
+_cache_lock = threading.Lock()
+CACHE_TTL = 300  # 5 minutes
+
 
 def get_bot_session():
     global _session
@@ -24,6 +30,35 @@ def get_bot_session():
         if _session is None:
             _session = get_session()
         return _session
+
+
+def get_cached_classes(date="", location="1", category="28", force=False):
+    """Return classes from cache if fresh, otherwise fetch and cache."""
+    cache_key = (date, location, category)
+    now = _time.time()
+
+    with _cache_lock:
+        cached = _class_cache.get(cache_key)
+        if cached and not force and (now - cached["fetched_at"]) < CACHE_TTL:
+            return cached["classes"]
+
+    # Fetch outside the lock to avoid blocking other requests
+    session = get_bot_session()
+    classes = get_classes(session, date=date, location=location, class_type=category)
+
+    with _cache_lock:
+        _class_cache[cache_key] = {"classes": classes, "fetched_at": _time.time()}
+
+    return classes
+
+
+def refresh_default_cache():
+    """Background job: keep the default view warm."""
+    try:
+        get_cached_classes(date="", location="1", category="28", force=True)
+        print(f"[{datetime.now()}] Cache refreshed")
+    except Exception as e:
+        print(f"[{datetime.now()}] Cache refresh error: {e}")
 
 
 def load_watchlist() -> list[dict]:
@@ -60,12 +95,11 @@ def check_and_book():
     if not watchlist:
         return
 
-    session = get_bot_session()
     now = datetime.now()
 
-    # Fetch current classes to see which have signup links
+    # Use cached classes (refreshed separately by refresh_default_cache)
     try:
-        classes = get_classes(session)
+        classes = get_cached_classes(force=True)
     except Exception as e:
         append_log({"time": now.isoformat(), "action": "fetch_error", "error": str(e)})
         return
@@ -160,25 +194,29 @@ def index():
 
 @app.route("/api/classes")
 def api_classes():
-    """Fetch all classes for the given week."""
+    """Fetch all classes for the given week (served from cache)."""
     date = request.args.get("date", "")
     location = request.args.get("location", "1")
     category = request.args.get("category", "28")
+    force = request.args.get("refresh", "") == "1"
 
-    session = get_bot_session()
     try:
-        classes = get_classes(session, date=date, location=location, class_type=category)
+        classes = get_cached_classes(date=date, location=location, category=category, force=force)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
     watchlist = load_watchlist()
     watched_keys = {(w["class_name"], w.get("class_date", ""), w.get("time", "")) for w in watchlist}
 
+    # Return a copy so we don't mutate the cache
+    result = []
     for cls in classes:
-        key = (cls["name"], cls.get("class_date", ""), cls.get("time", ""))
-        cls["watched"] = key in watched_keys
+        c = dict(cls)
+        key = (c["name"], c.get("class_date", ""), c.get("time", ""))
+        c["watched"] = key in watched_keys
+        result.append(c)
 
-    return jsonify(classes)
+    return jsonify(result)
 
 
 @app.route("/api/watchlist")
@@ -261,9 +299,10 @@ def api_log():
 
 # Start the scheduler at import time (works with both gunicorn and direct run)
 scheduler = BackgroundScheduler()
+scheduler.add_job(refresh_default_cache, "interval", minutes=5, id="refresh_cache", next_run_time=datetime.now())
 scheduler.add_job(check_and_book, "interval", seconds=30, id="check_and_book")
 scheduler.start()
-print("Scheduler started — checking watchlist every 30 seconds")
+print("Scheduler started — cache refresh every 5 min, watchlist check every 30 sec")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
