@@ -72,54 +72,30 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
         # Submit the form directly via JS — the button is type="button" so click
         # triggers a JS handler that may not work headless. Instead, submit the
         # parent form which POSTs to /ASP/login_p.asp
-        print("[login] Submitting login form via JS...")
-        page.evaluate("""() => {
-            const form = document.querySelector('#su1UserName').closest('form');
-            if (form) {
-                form.submit();
-            } else {
-                // Fallback: build and submit a form manually
-                const f = document.createElement('form');
-                f.method = 'POST';
-                f.action = '/ASP/login_p.asp';
-                const fields = {
-                    'requiredtxtUserName': document.querySelector('#su1UserName').value,
-                    'requiredtxtPassword': document.querySelector('#su1Password').value,
-                    'tg': '', 'vt': '', 'lvl': '', 'stype': '', 'qParam': '',
-                    'view': '', 'trn': '0', 'page': '', 'catid': '', 'prodid': '',
-                    'prodGroupId': '', 'date': '', 'classid': '0', 'sSU': '',
-                    'optForwardingLink': '', 'isAsync': 'false'
-                };
-                for (const [k, v] of Object.entries(fields)) {
-                    const inp = document.createElement('input');
-                    inp.type = 'hidden'; inp.name = k; inp.value = v;
-                    f.appendChild(inp);
+        # Submit the form and wait for the navigation to complete
+        print("[login] Submitting login form and waiting for navigation...")
+        with page.expect_navigation(wait_until="networkidle", timeout=60000):
+            page.evaluate("""() => {
+                const form = document.querySelector('#su1UserName').closest('form');
+                if (form) {
+                    form.submit();
                 }
-                document.body.appendChild(f);
-                f.submit();
-            }
-        }""")
-
-        # Wait for navigation after form submit
-        print("[login] Waiting for navigation after login...")
-        try:
-            page.wait_for_load_state("networkidle", timeout=30000)
-        except Exception as e:
-            print(f"[login] Navigation wait: {e}")
+            }""")
 
         print(f"[login] Post-login URL: {page.url}")
         print(f"[login] Post-login title: {page.title()}")
+
+        # The login_p.asp may redirect multiple times — wait for final page
+        page.wait_for_load_state("networkidle", timeout=30000)
+        print(f"[login] Final URL: {page.url}")
+
         content_lower = page.content().lower()
-        print(f"[login] Page has 'signed in': {'signed in' in content_lower}")
-        print(f"[login] Page has 'welcome': {'welcome' in content_lower}")
-        print(f"[login] Page has 'resetSession': {'resetsession' in content_lower}")
+        is_signed_in = "signed in" in content_lower or "you&#39;re signed in" in content_lower
+        print(f"[login] Page has 'signed in': {is_signed_in}")
         print(f"[login] Page length: {len(content_lower)} chars")
 
-        if "signed in" not in content_lower and "welcome" not in content_lower:
-            snippet = page.content()[:1500]
-            print(f"[login] Page snippet: {snippet}")
-            # Still extract cookies — Cloudflare cookies are the important ones
-            print("[login] Login may have failed, but extracting cookies anyway...")
+        if not is_signed_in:
+            print("[login] Not signed in on current page. Checking class schedule...")
 
         # Step 3: Navigate to class schedule to confirm session works
         print("[login] Navigating to class schedule to verify session...")
