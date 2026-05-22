@@ -49,7 +49,7 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
     print("[login] Launching headless browser...")
     with sync_playwright() as p:
         print("[login] Starting Chromium...")
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent=HEADERS["User-Agent"],
             viewport={"width": 1280, "height": 720},
@@ -88,6 +88,7 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
         print(f"[login] Extracted {len(browser_cookies)} cookies")
         cookie_names = [c["name"] for c in browser_cookies]
         print(f"[login] Cookie names: {cookie_names}")
+
         browser.close()
 
     # Convert to dict
