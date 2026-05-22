@@ -349,12 +349,15 @@
         }
 
         let html = `<div class="watchlist-item" style="color:#555; font-size:0.75rem; font-weight:600; border-bottom:1px solid #333;">
-          <div>Class</div><div class="wl-header-date">Date</div><div class="wl-header-time">Time</div><div>Status</div><div></div>
+          <div>Class</div><div class="wl-header-date">Date</div><div class="wl-header-time">Opens</div><div>Status</div><div></div>
         </div>`;
 
         for (const w of list) {
-          const sc = w.status === 'booked' ? 'status-booked' : 'status-waiting';
-          const st = w.status === 'booked' ? 'Booked' : 'Waiting';
+          const sc = w.status === 'booked' ? 'status-booked' : w.status === 'snagged' ? 'status-booked' : 'status-waiting';
+          let st = w.status === 'booked' || w.status === 'snagged' ? 'Booked' : 'Waiting';
+          if (w.status === 'waiting' && w.opens_in) {
+            st = `in ${w.opens_in}`;
+          }
           const rm = w.status !== 'booked'
             ? `<button class="btn-unwatch btn-small" onclick="unwatchByEntry(${JSON.stringify(w).replace(/"/g,'&quot;')})">Remove</button>` : '';
 
@@ -362,10 +365,10 @@
             <div class="watchlist-item">
               <div>
                 <strong>${w.class_name}</strong><br>
-                <span style="color:#888;font-size:0.75rem;">${w.teacher||''}</span>
+                <span style="color:#888;font-size:0.75rem;">${w.teacher||''} · ${w.time || ''}</span>
               </div>
               <div class="wl-date">${w.date_label || w.class_date || ''}</div>
-              <div class="wl-time">${w.time || ''}</div>
+              <div class="wl-time">${w.opens_in || '?'}</div>
               <div><span class="wl-status ${sc}">${st}</span></div>
               <div style="text-align:right;">${rm}</div>
             </div>`;

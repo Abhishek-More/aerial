@@ -1,25 +1,32 @@
 import json
 import os
+import re
 import threading
 import time as _time
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, jsonify, redirect, render_template, request, url_for
+from apscheduler.triggers.date import DateTrigger
+from flask import Flask, jsonify, render_template, request
 
-from bot import get_classes, get_session, signup_for_class
+from bot import get_classes, get_session, signup_for_class, login_with_playwright, get_credentials, apply_cookies, save_cookie_jar, check_session, HEADERS
 
 app = Flask(__name__)
 
 WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "booking_log.json")
 
-# Global session — reused across requests and scheduler
+# Signup opens exactly 1 week + 15 minutes before class start
+SIGNUP_OFFSET = timedelta(weeks=1, minutes=15)
+# Re-auth 5 minutes before signup opens
+REAUTH_BEFORE = timedelta(minutes=5)
+
+# Global session
 _session = None
 _session_lock = threading.Lock()
 
-# In-memory class cache — refreshed every 5 minutes by the scheduler
-_class_cache = {}  # key: (date, location, category) -> {"classes": [...], "fetched_at": float}
+# In-memory class cache
+_class_cache = {}
 _cache_lock = threading.Lock()
 CACHE_TTL = 300  # 5 minutes
 
@@ -34,6 +41,24 @@ def get_bot_session():
         return _session
 
 
+def force_reauth():
+    """Force a fresh login to get new cookies."""
+    global _session
+    print("[reauth] Forcing re-authentication...")
+    with _session_lock:
+        import requests as req
+        _session = req.Session()
+        _session.headers.update(HEADERS)
+        email, password = get_credentials()
+        cookies = login_with_playwright(email, password)
+        apply_cookies(_session, cookies)
+        save_cookie_jar(_session)
+        if check_session(_session):
+            print("[reauth] Re-auth successful, session valid.")
+        else:
+            print("[reauth] Re-auth done but session check failed!")
+
+
 def get_cached_classes(date="", location="1", category="28", force=False):
     """Return classes from cache if fresh, otherwise fetch and cache."""
     cache_key = (date, location, category)
@@ -42,13 +67,10 @@ def get_cached_classes(date="", location="1", category="28", force=False):
     with _cache_lock:
         cached = _class_cache.get(cache_key)
         if cached and not force and (now - cached["fetched_at"]) < CACHE_TTL:
-            age = int(now - cached["fetched_at"])
-            print(f"[cache] HIT for {cache_key} (age: {age}s, {len(cached['classes'])} classes)")
             return cached["classes"]
 
-    print(f"[cache] MISS for {cache_key}, force={force}. Fetching from MindBody...")
+    print(f"[cache] MISS for {cache_key}, force={force}. Fetching...")
     session = get_bot_session()
-    print(f"[cache] Session ready. Fetching classes...")
     classes = get_classes(session, date=date, location=location, class_type=category)
     print(f"[cache] Fetched {len(classes)} classes")
 
@@ -60,13 +82,14 @@ def get_cached_classes(date="", location="1", category="28", force=False):
 
 def refresh_default_cache():
     """Background job: keep the default view warm."""
-    print(f"[scheduler] Cache refresh starting...")
     try:
         classes = get_cached_classes(date="", location="1", category="28", force=True)
         print(f"[scheduler] Cache refreshed: {len(classes)} classes")
     except Exception as e:
         print(f"[scheduler] Cache refresh error: {type(e).__name__}: {e}")
 
+
+# --- Watchlist helpers ---
 
 def load_watchlist() -> list[dict]:
     if os.path.exists(WATCHLIST_FILE):
@@ -90,106 +113,183 @@ def load_log() -> list[dict]:
 def append_log(entry: dict):
     log = load_log()
     log.insert(0, entry)
-    # Keep last 100 entries
     log = log[:100]
     with open(LOG_FILE, "w") as f:
         json.dump(log, f, indent=2)
 
 
-def check_and_book():
-    """Scheduler job: check watchlist and book classes whose signup is now available."""
-    watchlist = load_watchlist()
-    if not watchlist:
+# --- Precise booking scheduler ---
+
+def parse_class_datetime(class_date: str, time_str: str) -> datetime | None:
+    """Parse class_date (M/D/YYYY) and time (e.g. '9:30 am EDT') into a datetime."""
+    try:
+        time_clean = re.sub(r"[\xa0\s]+", " ", time_str).strip()
+        time_clean = re.sub(r"\s+[A-Z]{2,4}$", "", time_clean).strip()
+        return datetime.strptime(f"{class_date} {time_clean}", "%m/%d/%Y %I:%M %p")
+    except (ValueError, TypeError):
+        return None
+
+
+def compute_open_time(class_dt: datetime) -> datetime:
+    """Signup opens 1 week + 15 minutes before class start."""
+    return class_dt - SIGNUP_OFFSET
+
+
+def compute_reauth_time(open_time: datetime) -> datetime:
+    """Re-auth 5 minutes before signup opens."""
+    return open_time - REAUTH_BEFORE
+
+
+def schedule_snag(watch: dict):
+    """Schedule re-auth and rapid booking for a watched class."""
+    class_dt = parse_class_datetime(watch.get("class_date", ""), watch.get("time", ""))
+    if not class_dt:
+        print(f"[snag] Cannot parse datetime for: {watch.get('class_name')}")
         return
 
+    open_time = compute_open_time(class_dt)
+    reauth_time = compute_reauth_time(open_time)
     now = datetime.now()
 
-    # Use cached classes (refreshed separately by refresh_default_cache)
-    try:
-        classes = get_cached_classes(force=True)
-    except Exception as e:
-        append_log({"time": now.isoformat(), "action": "fetch_error", "error": str(e)})
-        return
+    watch_key = f"{watch['class_name']}_{watch.get('class_date','')}_{watch.get('time','')}"
+    safe_id = re.sub(r"[^a-zA-Z0-9_]", "", watch_key)[:60]
 
-    # Build lookup: (class_name, class_date_str, time) -> class_info
-    # Also build by class_id for direct matching
-    available = {}
-    for cls in classes:
-        if cls["has_signup"] and cls["class_id"]:
-            available[cls["class_id"]] = cls
+    print(f"[snag] Class: {watch['class_name']} on {watch.get('class_date')} at {watch.get('time')}")
+    print(f"[snag]   Class time:  {class_dt}")
+    print(f"[snag]   Signup opens: {open_time}")
+    print(f"[snag]   Re-auth at:  {reauth_time}")
 
-    updated = False
-    remaining = []
+    # Schedule re-auth (only if in the future)
+    reauth_job_id = f"reauth_{safe_id}"
+    if reauth_time > now:
+        # Remove existing job if rescheduling
+        try:
+            scheduler.remove_job(reauth_job_id)
+        except Exception:
+            pass
+        scheduler.add_job(
+            force_reauth,
+            trigger=DateTrigger(run_date=reauth_time),
+            id=reauth_job_id,
+            replace_existing=True,
+        )
+        print(f"[snag]   Re-auth scheduled for {reauth_time}")
+    else:
+        print(f"[snag]   Re-auth time already passed, skipping")
+
+    # Schedule rapid booking attempts starting at open time
+    snag_job_id = f"snag_{safe_id}"
+    if open_time > now:
+        try:
+            scheduler.remove_job(snag_job_id)
+        except Exception:
+            pass
+        scheduler.add_job(
+            rapid_book,
+            trigger=DateTrigger(run_date=open_time),
+            args=[watch],
+            id=snag_job_id,
+            replace_existing=True,
+        )
+        print(f"[snag]   Booking scheduled for {open_time}")
+    elif open_time > now - timedelta(minutes=5):
+        # Signup just opened recently — try immediately
+        print(f"[snag]   Signup just opened, attempting now...")
+        threading.Thread(target=rapid_book, args=[watch], daemon=True).start()
+    else:
+        print(f"[snag]   Signup opened long ago — will try on next cache refresh")
+
+
+def rapid_book(watch: dict):
+    """
+    Rapid-fire booking: try every 2 seconds for 60 seconds.
+    The signup link may take a moment to appear after the open time.
+    """
+    class_name = watch.get("class_name", "?")
+    class_date = watch.get("class_date", "")
+    time_str = watch.get("time", "")
+    print(f"[rapid_book] Starting rapid booking for {class_name} on {class_date} at {time_str}")
+
+    append_log({
+        "time": datetime.now().isoformat(),
+        "action": "snag_started",
+        "class": class_name,
+        "date": class_date,
+    })
+
+    session = get_bot_session()
+    attempts = 0
+    max_attempts = 30  # 30 attempts * 2s = 60 seconds
+
+    while attempts < max_attempts:
+        attempts += 1
+        now = datetime.now()
+        print(f"[rapid_book] Attempt {attempts}/{max_attempts} at {now.strftime('%H:%M:%S')}")
+
+        try:
+            # Fetch fresh class list to find the class_id
+            classes = get_classes(session, date=class_date, location="1", class_type="28")
+
+            # Find our class
+            for cls in classes:
+                if (cls["has_signup"]
+                        and cls["class_id"]
+                        and cls["name"] == watch.get("class_name")
+                        and cls["class_date"] == class_date
+                        and cls["time"] == time_str):
+
+                    print(f"[rapid_book] Found signup for {class_name}! class_id={cls['class_id']}")
+
+                    result = signup_for_class(session, cls["class_id"], cls["class_date"])
+                    print(f"[rapid_book] RESULT: {result}")
+
+                    # Update watchlist
+                    watchlist = load_watchlist()
+                    for w in watchlist:
+                        if (w["class_name"] == class_name
+                                and w.get("class_date") == class_date
+                                and w.get("time") == time_str):
+                            w["status"] = "booked"
+                            w["result"] = result
+                            w["booked_at"] = now.isoformat()
+                            w["class_id"] = cls["class_id"]
+                            break
+                    save_watchlist(watchlist)
+
+                    append_log({
+                        "time": now.isoformat(),
+                        "action": "snagged",
+                        "class": class_name,
+                        "date": class_date,
+                        "result": result,
+                        "attempts": attempts,
+                    })
+                    return
+
+            print(f"[rapid_book] Signup not available yet...")
+
+        except Exception as e:
+            print(f"[rapid_book] Attempt {attempts} error: {e}")
+
+        _time.sleep(2)
+
+    # Exhausted attempts
+    print(f"[rapid_book] Failed to snag {class_name} after {max_attempts} attempts")
+    append_log({
+        "time": datetime.now().isoformat(),
+        "action": "snag_failed",
+        "class": class_name,
+        "date": class_date,
+        "attempts": max_attempts,
+    })
+
+
+def schedule_all_watches():
+    """On startup / when watchlist changes, schedule all pending watches."""
+    watchlist = load_watchlist()
     for watch in watchlist:
-        # If already booked, skip
-        if watch.get("status") == "booked":
-            remaining.append(watch)
-            continue
-
-        # Check if this watched class now has a signup link
-        cid = watch.get("class_id")
-        if cid and cid in available:
-            cls = available[cid]
-            try:
-                result = signup_for_class(session, cls["class_id"], cls["class_date"])
-                watch["status"] = "booked"
-                watch["result"] = result
-                watch["booked_at"] = now.isoformat()
-                updated = True
-                append_log({
-                    "time": now.isoformat(),
-                    "action": "booked",
-                    "class": watch["class_name"],
-                    "date": watch["class_date"],
-                    "result": result,
-                })
-                print(f"[{now}] BOOKED: {watch['class_name']} on {watch['class_date']} -> {result}")
-            except Exception as e:
-                append_log({
-                    "time": now.isoformat(),
-                    "action": "book_error",
-                    "class": watch["class_name"],
-                    "error": str(e),
-                })
-                print(f"[{now}] ERROR booking {watch['class_name']}: {e}")
-        else:
-            # Not yet available — try matching by name/date/time if class_id is unknown
-            if not cid:
-                for avail_cls in classes:
-                    if (avail_cls["has_signup"]
-                            and avail_cls["class_id"]
-                            and avail_cls["name"] == watch.get("class_name")
-                            and avail_cls["class_date"] == watch.get("class_date")
-                            and avail_cls["time"] == watch.get("time")):
-                        # Found it — update the watch with the real class_id and book
-                        watch["class_id"] = avail_cls["class_id"]
-                        try:
-                            result = signup_for_class(session, avail_cls["class_id"], avail_cls["class_date"])
-                            watch["status"] = "booked"
-                            watch["result"] = result
-                            watch["booked_at"] = now.isoformat()
-                            updated = True
-                            append_log({
-                                "time": now.isoformat(),
-                                "action": "booked",
-                                "class": watch["class_name"],
-                                "date": watch["class_date"],
-                                "result": result,
-                            })
-                            print(f"[{now}] BOOKED: {watch['class_name']} on {watch['class_date']} -> {result}")
-                        except Exception as e:
-                            append_log({
-                                "time": now.isoformat(),
-                                "action": "book_error",
-                                "class": watch["class_name"],
-                                "error": str(e),
-                            })
-                        break
-
-        remaining.append(watch)
-
-    if updated:
-        save_watchlist(remaining)
+        if watch.get("status") == "waiting":
+            schedule_snag(watch)
 
 
 # --- Routes ---
@@ -215,7 +315,6 @@ def api_classes():
     watchlist = load_watchlist()
     watched_keys = {(w["class_name"], w.get("class_date", ""), w.get("time", "")) for w in watchlist}
 
-    # Return a copy so we don't mutate the cache
     result = []
     for cls in classes:
         c = dict(cls)
@@ -228,12 +327,23 @@ def api_classes():
 
 @app.route("/api/watchlist")
 def api_watchlist():
-    return jsonify(load_watchlist())
+    watchlist = load_watchlist()
+    # Enrich with computed open times
+    for w in watchlist:
+        class_dt = parse_class_datetime(w.get("class_date", ""), w.get("time", ""))
+        if class_dt:
+            open_time = compute_open_time(class_dt)
+            w["open_time"] = open_time.isoformat()
+            w["opens_in"] = str(open_time - datetime.now()).split(".")[0] if open_time > datetime.now() else "now"
+        else:
+            w["open_time"] = None
+            w["opens_in"] = "?"
+    return jsonify(watchlist)
 
 
 @app.route("/api/watch", methods=["POST"])
 def api_watch():
-    """Add a class to the watchlist."""
+    """Add a class to the watchlist and schedule its snag."""
     data = request.json
     watchlist = load_watchlist()
 
@@ -257,14 +367,40 @@ def api_watch():
 
     watchlist.append(entry)
     save_watchlist(watchlist)
-    return jsonify({"status": "added"})
+
+    # Schedule the snag for this class
+    schedule_snag(entry)
+
+    class_dt = parse_class_datetime(entry["class_date"], entry["time"])
+    open_time = compute_open_time(class_dt) if class_dt else None
+
+    return jsonify({
+        "status": "added",
+        "open_time": open_time.isoformat() if open_time else None,
+    })
 
 
 @app.route("/api/unwatch", methods=["POST"])
 def api_unwatch():
-    """Remove a class from the watchlist."""
+    """Remove a class from the watchlist and cancel its scheduled jobs."""
     data = request.json
     watchlist = load_watchlist()
+
+    # Find the watch to remove and cancel its jobs
+    for w in watchlist:
+        if (w["class_name"] == data["name"]
+                and w.get("class_date") == data.get("class_date")
+                and w.get("time") == data.get("time")):
+            watch_key = f"{w['class_name']}_{w.get('class_date','')}_{w.get('time','')}"
+            safe_id = re.sub(r"[^a-zA-Z0-9_]", "", watch_key)[:60]
+            for prefix in ["reauth_", "snag_"]:
+                try:
+                    scheduler.remove_job(f"{prefix}{safe_id}")
+                    print(f"[unwatch] Cancelled job {prefix}{safe_id}")
+                except Exception:
+                    pass
+            break
+
     watchlist = [
         w for w in watchlist
         if not (w["class_name"] == data["name"]
@@ -304,15 +440,19 @@ def api_log():
     return jsonify(load_log())
 
 
-# Start the scheduler at import time (works with both gunicorn and direct run)
-# Delay first run by 10s so gunicorn worker can finish booting and accept requests
+# --- Scheduler startup ---
 scheduler = BackgroundScheduler()
+
+# Cache refresh every 5 min (delayed 10s on startup)
 scheduler.add_job(refresh_default_cache, "interval", minutes=5, id="refresh_cache",
                   next_run_time=datetime.now() + timedelta(seconds=10))
-scheduler.add_job(check_and_book, "interval", seconds=30, id="check_and_book",
-                  next_run_time=datetime.now() + timedelta(seconds=15))
+
+# Schedule all existing watches on startup (delayed 15s)
+scheduler.add_job(schedule_all_watches, trigger=DateTrigger(run_date=datetime.now() + timedelta(seconds=15)),
+                  id="init_watches")
+
 scheduler.start()
-print("Scheduler started — first cache refresh in 10s")
+print("Scheduler started — cache refresh in 10s, watch scheduling in 15s")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
