@@ -162,8 +162,8 @@ def index():
 def api_classes():
     """Fetch all classes for the given week."""
     date = request.args.get("date", "")
-    location = request.args.get("location", "0")
-    category = request.args.get("category", "0")
+    location = request.args.get("location", "1")
+    category = request.args.get("category", "28")
 
     session = get_bot_session()
     try:

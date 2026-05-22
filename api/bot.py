@@ -5,7 +5,6 @@ import cloudscraper
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://clients.mindbodyonline.com"
-CREDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "creds.json")
 COOKIE_JAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cookie_jar.json")
 
 HEADERS = {
@@ -110,23 +109,12 @@ def check_session(session: cloudscraper.CloudScraper) -> bool:
 
 
 def get_credentials() -> tuple[str, str]:
-    """Load or prompt for credentials."""
-    if os.path.exists(CREDS_FILE):
-        with open(CREDS_FILE) as f:
-            creds = json.load(f)
-        return creds["email"], creds["password"]
-
-    print("No saved credentials found.")
-    email = input("Email: ").strip()
-    password = input("Password: ").strip()
-
-    save = input("Save credentials for next time? (y/n): ").strip().lower()
-    if save == "y":
-        with open(CREDS_FILE, "w") as f:
-            json.dump({"email": email, "password": password}, f)
-        os.chmod(CREDS_FILE, 0o600)
-        print(f"Saved to {CREDS_FILE}")
-
+    """Load credentials from environment variables."""
+    email = os.environ.get("MB_EMAIL", "")
+    password = os.environ.get("MB_PASSWORD", "")
+    if not email or not password:
+        print("Set MB_EMAIL and MB_PASSWORD environment variables.")
+        exit(1)
     return email, password
 
 
@@ -152,9 +140,9 @@ def get_session() -> cloudscraper.CloudScraper:
 def get_classes(
     session: cloudscraper.CloudScraper,
     date: str = "",
-    location: str = "0",
+    location: str = "1",
     tab_id: str = "7",
-    class_type: str = "0",
+    class_type: str = "28",
 ) -> list[dict]:
     """Fetch and parse the weekly class schedule."""
     if not date:
@@ -292,7 +280,24 @@ def parse_classes(html: str) -> list[dict]:
             "class_date": class_date,
         })
 
-    return classes
+    # Filter out classes in the past
+    from datetime import datetime as _dt2
+    now = _dt2.now()
+    future_classes = []
+    for cls in classes:
+        if not cls["class_date"]:
+            future_classes.append(cls)
+            continue
+        try:
+            # Normalize: replace &nbsp; and extra whitespace, strip timezone
+            time_clean = re.sub(r"[\xa0\s]+", " ", cls["time"]).strip()
+            time_clean = re.sub(r"\s+[A-Z]{2,4}$", "", time_clean).strip()
+            cls_dt = _dt2.strptime(f"{cls['class_date']} {time_clean}", "%m/%d/%Y %I:%M %p")
+            if cls_dt >= now:
+                future_classes.append(cls)
+        except ValueError as e:
+            future_classes.append(cls)
+    return future_classes
 
 
 def signup_for_class(session: cloudscraper.CloudScraper, class_id: str, class_date: str, tg: str = "28", cls_loc: str = "1") -> str:

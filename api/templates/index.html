@@ -117,8 +117,12 @@
 
         <div id="classes" class="tab-content active">
             <div class="refresh-bar">
+                <button onclick="changeWeek(-1)">&larr; Prev Week</button>
                 <span id="classStatus" style="color: #666; font-size: 0.85rem;"></span>
-                <button onclick="fetchClasses()">Refresh</button>
+                <div style="display:flex; gap:8px;">
+                    <button onclick="goToday()">Today</button>
+                    <button onclick="changeWeek(1)">Next Week &rarr;</button>
+                </div>
             </div>
             <div id="classList"><div class="loading">Loading classes...</div></div>
         </div>
@@ -162,15 +166,31 @@
 
         // --- Classes ---
         let allClasses = [];
+        let currentDate = new Date();
+
+        function formatDate(d) {
+            return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+        }
+
+        function changeWeek(dir) {
+            currentDate.setDate(currentDate.getDate() + dir * 7);
+            fetchClasses();
+        }
+
+        function goToday() {
+            currentDate = new Date();
+            fetchClasses();
+        }
 
         async function fetchClasses() {
             document.getElementById('classList').innerHTML = '<div class="loading">Loading classes...</div>';
             try {
-                const res = await fetch('/api/classes');
+                const dateStr = formatDate(currentDate);
+                const res = await fetch(`/api/classes?date=${encodeURIComponent(dateStr)}`);
                 allClasses = await res.json();
                 if (allClasses.error) throw new Error(allClasses.error);
                 renderClasses(allClasses);
-                document.getElementById('classStatus').textContent = `${allClasses.length} classes loaded`;
+                document.getElementById('classStatus').textContent = `${allClasses.length} classes  ·  Week of ${dateStr}`;
             } catch (e) {
                 document.getElementById('classList').innerHTML = `<div class="loading" style="color:#ef4444;">Error: ${e.message}</div>`;
             }

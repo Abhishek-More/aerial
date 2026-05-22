@@ -1,6 +1,8 @@
+.env
 creds.json
 .cookie_jar.json
 cookies.txt
 watchlist.json
 booking_log.json
 __pycache__/
+*.pyc
