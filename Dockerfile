@@ -16,6 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install playwright chromium browser
 RUN playwright install chromium
 
+ENV PYTHONUNBUFFERED=1
+
 COPY api/ ./api/
 
 WORKDIR /app/api
