@@ -113,8 +113,7 @@ def get_credentials() -> tuple[str, str]:
     email = os.environ.get("MB_EMAIL", "")
     password = os.environ.get("MB_PASSWORD", "")
     if not email or not password:
-        print("Set MB_EMAIL and MB_PASSWORD environment variables.")
-        exit(1)
+        raise RuntimeError("Set MB_EMAIL and MB_PASSWORD environment variables.")
     return email, password
 
 
@@ -133,8 +132,7 @@ def get_session() -> cloudscraper.CloudScraper:
     if login(session, email, password):
         return session
 
-    print("Login failed. Check your credentials and try again.")
-    exit(1)
+    raise RuntimeError("Login failed. Check your credentials and try again.")
 
 
 def get_classes(
