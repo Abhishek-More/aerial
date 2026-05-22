@@ -175,9 +175,9 @@ def get_session() -> requests.Session:
 def get_classes(
     session: requests.Session,
     date: str = "",
-    location: str = "1",
+    location: str = "0",
     tab_id: str = "7",
-    class_type: str = "28",
+    class_type: str = "0",
 ) -> list[dict]:
     """Fetch and parse the weekly class schedule."""
     if not date:

@@ -60,7 +60,7 @@ def force_reauth():
             print("[reauth] Re-auth done but session check failed!")
 
 
-def get_cached_classes(date="", location="1", category="28", force=False):
+def get_cached_classes(date="", location="0", category="0", force=False):
     """Return classes from cache if fresh, otherwise fetch and cache."""
     cache_key = (date, location, category)
     now = _time.time()
@@ -84,7 +84,7 @@ def get_cached_classes(date="", location="1", category="28", force=False):
 def refresh_default_cache():
     """Background job: keep the default view warm."""
     try:
-        classes = get_cached_classes(date="", location="1", category="28", force=True)
+        classes = get_cached_classes(date="", location="0", category="0", force=True)
         print(f"[scheduler] Cache refreshed: {len(classes)} classes")
     except Exception as e:
         print(f"[scheduler] Cache refresh error: {type(e).__name__}: {e}")
@@ -234,7 +234,7 @@ def rapid_book(watch: dict):
 
         try:
             # Fetch fresh class list to find the class_id
-            classes = get_classes(session, date=class_date, location="1", class_type="28")
+            classes = get_classes(session, date=class_date, location="0", class_type="0")
 
             # Find our class
             for cls in classes:
@@ -309,8 +309,8 @@ def index():
 def api_classes():
     """Fetch all classes for the given week (served from cache)."""
     date = request.args.get("date", "")
-    location = request.args.get("location", "1")
-    category = request.args.get("category", "28")
+    location = request.args.get("location", "0")
+    category = request.args.get("category", "0")
     force = request.args.get("refresh", "") == "1"
 
     try:
