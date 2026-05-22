@@ -40,102 +40,15 @@ def load_cookie_jar(session: requests.Session) -> bool:
     return bool(cookies)
 
 
-def get_cloudflare_cookies() -> dict[str, str]:
-    """
-    Use playwright just to bypass Cloudflare.
-    Returns cookies (cf_clearance, __cf_bm, ASP.NET_SessionId, etc.)
-    """
-    from playwright.sync_api import sync_playwright
-
-    print("[cf] Launching headless browser to bypass Cloudflare...")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=HEADERS["User-Agent"],
-            viewport={"width": 1280, "height": 720},
-        )
-        page = context.new_page()
-
-        print(f"[cf] Navigating to {BASE_URL}/classic/ws?studioid=836167")
-        page.goto(f"{BASE_URL}/classic/ws?studioid=836167", wait_until="networkidle", timeout=60000)
-        print(f"[cf] Page loaded. URL: {page.url}")
-
-        browser_cookies = context.cookies()
-        print(f"[cf] Extracted {len(browser_cookies)} cookies")
-        cookie_names = [c["name"] for c in browser_cookies]
-        print(f"[cf] Cookie names: {cookie_names}")
-        browser.close()
-
-    cookies = {}
-    for c in browser_cookies:
-        cookies[c["name"]] = {
-            "value": c["value"],
-            "domain": c["domain"],
-            "path": c.get("path", "/"),
-        }
-    return cookies
-
-
-def login_with_requests(session: requests.Session, email: str, password: str) -> bool:
-    """
-    Login via HTTP POST using a session that already has Cloudflare cookies.
-    Returns True if idsrvauth cookie is set after login.
-    """
-    print(f"[login] POSTing to login_p.asp with email={email}")
-    login_url = f"{BASE_URL}/ASP/login_p.asp"
-    login_data = {
-        "requiredtxtUserName": email,
-        "requiredtxtPassword": password,
-        "tg": "",
-        "vt": "",
-        "lvl": "",
-        "stype": "",
-        "qParam": "",
-        "view": "",
-        "trn": "0",
-        "page": "",
-        "catid": "",
-        "prodid": "",
-        "prodGroupId": "",
-        "date": "",
-        "classid": "0",
-        "sSU": "",
-        "optForwardingLink": "",
-        "isAsync": "false",
-    }
-    resp = session.post(login_url, data=login_data, allow_redirects=True, timeout=30)
-    print(f"[login] Response: status={resp.status_code} url={resp.url} length={len(resp.text)}")
-
-    # Check cookies after login
-    cookie_names = [c.name for c in session.cookies]
-    print(f"[login] Session cookies after login: {cookie_names}")
-    has_auth = "idsrvauth" in cookie_names
-    print(f"[login] Has idsrvauth: {has_auth}")
-
-    if has_auth:
-        print("[login] Login successful!")
-        return True
-
-    # Check response for clues
-    if "you&#39;re signed in" in resp.text.lower() or "you're signed in" in resp.text.lower():
-        print("[login] Page says signed in (but no idsrvauth cookie?)")
-        return True
-
-    if "login=false" in resp.url or "incorrect" in resp.text.lower():
-        print("[login] Login rejected — bad credentials?")
-        return False
-
-    print(f"[login] Login unclear. Response snippet: {resp.text[:500]}")
-    return False
-
-
 def login_with_playwright(email: str, password: str) -> dict[str, str]:
     """
-    Legacy: full playwright login. Used as fallback or locally.
+    Use playwright to navigate to the login page, then POST credentials
+    via fetch() inside the browser context (same session, same cookies).
+    Returns all cookies including idsrvauth.
     """
     from playwright.sync_api import sync_playwright
 
-    print("[login-pw] Full playwright login...")
+    print("[login] Launching headless browser...")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -144,23 +57,91 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
         )
         page = context.new_page()
 
+        # Step 1: Navigate to login page (solves Cloudflare, establishes ASP session)
+        print(f"[login] Navigating to {BASE_URL}/classic/ws?studioid=836167")
         page.goto(f"{BASE_URL}/classic/ws?studioid=836167", wait_until="networkidle", timeout=60000)
-        page.wait_for_selector("#su1UserName", timeout=30000)
-        page.fill("#su1UserName", email)
-        page.fill("#su1Password", password)
-        page.click("#btnSu1Login")
+        print(f"[login] Page loaded. URL: {page.url}")
 
-        # Wait for idsrvauth
-        for i in range(30):
-            page.wait_for_timeout(1000)
-            cookies_now = context.cookies()
-            if any(c["name"] == "idsrvauth" for c in cookies_now):
-                print(f"[login-pw] Got idsrvauth after {i+1}s")
-                break
+        cookies_before = [c["name"] for c in context.cookies()]
+        print(f"[login] Cookies before login: {cookies_before}")
 
+        # Step 2: POST login from inside the browser via fetch()
+        # This uses the browser's cookies (ASP.NET_SessionId, cf_clearance, etc.)
+        print("[login] Submitting login via in-browser fetch()...")
+        login_result = page.evaluate("""async (creds) => {
+            const formData = new URLSearchParams();
+            formData.append('requiredtxtUserName', creds.email);
+            formData.append('requiredtxtPassword', creds.password);
+            formData.append('tg', '');
+            formData.append('vt', '');
+            formData.append('lvl', '');
+            formData.append('stype', '');
+            formData.append('qParam', '');
+            formData.append('view', '');
+            formData.append('trn', '0');
+            formData.append('page', '');
+            formData.append('catid', '');
+            formData.append('prodid', '');
+            formData.append('prodGroupId', '');
+            formData.append('date', '');
+            formData.append('classid', '0');
+            formData.append('sSU', '');
+            formData.append('optForwardingLink', '');
+            formData.append('isAsync', 'false');
+
+            try {
+                const resp = await fetch('/ASP/login_p.asp', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: formData.toString(),
+                    credentials: 'include',
+                    redirect: 'follow',
+                });
+                const text = await resp.text();
+                return {
+                    status: resp.status,
+                    url: resp.url,
+                    length: text.length,
+                    snippet: text.substring(0, 500),
+                    ok: resp.ok,
+                };
+            } catch(e) {
+                return {error: e.message};
+            }
+        }""", {"email": email, "password": password})
+
+        print(f"[login] Fetch result: {login_result}")
+
+        # Step 3: Navigate to a page to let any set-cookie headers take effect
+        print("[login] Navigating to main page to finalize cookies...")
+        try:
+            page.goto(f"{BASE_URL}/classic/mainclass?fl=true&tabID=7", wait_until="networkidle", timeout=30000)
+            print(f"[login] Main page URL: {page.url}")
+        except Exception as e:
+            print(f"[login] Main page navigation: {e}")
+
+        # Step 4: Extract all cookies
         browser_cookies = context.cookies()
+        print(f"[login] Extracted {len(browser_cookies)} cookies")
         cookie_names = [c["name"] for c in browser_cookies]
-        print(f"[login-pw] Cookies: {cookie_names}")
+        print(f"[login] Cookie names: {cookie_names}")
+        has_auth = "idsrvauth" in cookie_names
+        print(f"[login] Has idsrvauth: {has_auth}")
+
+        if not has_auth:
+            # One more try: the fetch response might have triggered a redirect
+            # that sets cookies. Navigate to the redirect URL if present.
+            if login_result and "login=false" not in str(login_result.get("snippet", "")):
+                print("[login] Trying one more page load...")
+                try:
+                    page.goto(f"{BASE_URL}/ASP/main_info.asp", wait_until="networkidle", timeout=15000)
+                    browser_cookies = context.cookies()
+                    cookie_names = [c["name"] for c in browser_cookies]
+                    has_auth = "idsrvauth" in cookie_names
+                    print(f"[login] After main_info: cookies={cookie_names} has_auth={has_auth}")
+                except Exception:
+                    pass
+
         browser.close()
 
     cookies = {}
@@ -171,6 +152,16 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
             "path": c.get("path", "/"),
         }
     return cookies
+
+
+def get_cloudflare_cookies():
+    """Kept for compatibility but login_with_playwright handles everything now."""
+    return login_with_playwright("", "")
+
+
+def login_with_requests(session, email, password):
+    """Kept for compatibility."""
+    return False
 
 
 def apply_cookies(session: requests.Session, cookies: dict):
@@ -219,27 +210,14 @@ def get_session() -> requests.Session:
         print("[get_session] Restored session from saved cookies.")
         return session
 
-    # Try 2: Playwright for Cloudflare bypass, then requests for login
-    print("[get_session] Try 2: Cloudflare bypass + requests login...")
+    # Try 2: Login with playwright
+    print("[get_session] Try 2: Playwright login...")
     session.cookies.clear()
     email, password = get_credentials()
     print(f"[get_session] Credentials loaded for: {email}")
 
-    # Step A: Get Cloudflare cookies via playwright
-    cf_cookies = get_cloudflare_cookies()
-    print(f"[get_session] Got {len(cf_cookies)} Cloudflare cookies")
-    apply_cookies(session, cf_cookies)
-
-    # Step B: Login via requests POST (now that we have cf_clearance)
-    if login_with_requests(session, email, password):
-        print("[get_session] Login via requests succeeded!")
-        save_cookie_jar(session)
-        return session
-
-    # Try 3: Full playwright login as fallback
-    print("[get_session] Try 3: Full playwright login fallback...")
-    session.cookies.clear()
     cookies = login_with_playwright(email, password)
+    print(f"[get_session] Got {len(cookies)} cookies from playwright")
     apply_cookies(session, cookies)
     save_cookie_jar(session)
 
