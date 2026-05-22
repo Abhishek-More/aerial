@@ -48,9 +48,14 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
     from playwright.sync_api import sync_playwright
 
     print("[login] Launching headless browser...")
+    proxy_url = os.environ.get("PROXY_URL", "")
     with sync_playwright() as p:
+        launch_args = {"headless": True}
+        if proxy_url:
+            print(f"[login] Using proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
+            launch_args["proxy"] = {"server": proxy_url}
         print("[login] Starting Chromium...")
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(**launch_args)
         context = browser.new_context(
             user_agent=HEADERS["User-Agent"],
             viewport={"width": 1280, "height": 720},
@@ -140,6 +145,12 @@ def get_session() -> requests.Session:
     print("[get_session] Creating new session...")
     session = requests.Session()
     session.headers.update(HEADERS)
+
+    # Route requests through proxy if set
+    proxy_url = os.environ.get("PROXY_URL", "")
+    if proxy_url:
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+        print(f"[get_session] Using proxy for requests")
 
     # Try 1: Load saved cookie jar from last successful session
     print("[get_session] Try 1: Loading saved cookie jar...")
