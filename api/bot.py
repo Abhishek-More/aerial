@@ -51,14 +51,26 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
     proxy_url = os.environ.get("PROXY_URL", "")
     with sync_playwright() as p:
         launch_args = {"headless": True}
+        proxy_config = None
         if proxy_url:
-            print(f"[login] Using proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
-            launch_args["proxy"] = {"server": proxy_url}
+            # Parse http://user:pass@host:port into playwright proxy config
+            from urllib.parse import urlparse
+            parsed = urlparse(proxy_url)
+            proxy_config = {
+                "server": f"{parsed.scheme or 'http'}://{parsed.hostname}:{parsed.port}",
+            }
+            if parsed.username:
+                proxy_config["username"] = parsed.username
+            if parsed.password:
+                proxy_config["password"] = parsed.password
+            print(f"[login] Using proxy: {parsed.hostname}:{parsed.port}")
+            launch_args["proxy"] = proxy_config
         print("[login] Starting Chromium...")
         browser = p.chromium.launch(**launch_args)
         context = browser.new_context(
             user_agent=HEADERS["User-Agent"],
             viewport={"width": 1280, "height": 720},
+            ignore_https_errors=True,
         )
         page = context.new_page()
 
