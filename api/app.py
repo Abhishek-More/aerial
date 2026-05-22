@@ -13,8 +13,9 @@ from bot import get_classes, get_session, signup_for_class, login_with_playwrigh
 
 app = Flask(__name__)
 
-WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "booking_log.json")
+DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+WATCHLIST_FILE = os.path.join(DATA_DIR, "watchlist.json")
+LOG_FILE = os.path.join(DATA_DIR, "booking_log.json")
 
 # Signup opens exactly 1 week + 15 minutes before class start
 SIGNUP_OFFSET = timedelta(weeks=1, minutes=15)

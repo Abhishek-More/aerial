@@ -5,7 +5,8 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://clients.mindbodyonline.com"
-COOKIE_JAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cookie_jar.json")
+_DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+COOKIE_JAR_FILE = os.path.join(_DATA_DIR, ".cookie_jar.json")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
