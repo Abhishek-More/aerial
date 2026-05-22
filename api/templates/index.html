@@ -84,7 +84,7 @@
 
       /* Watchlist */
       .watchlist-item {
-        display: grid; grid-template-columns: 1fr 130px 120px 80px 80px;
+        display: grid; grid-template-columns: 1fr 130px 120px 80px;
         align-items: center; padding: 12px 8px; border-bottom: 1px solid #1a1a2e;
         gap: 8px;
       }
@@ -99,13 +99,6 @@
       .dot-booking { background: #22c55e; animation: pulse 1s infinite; }
       .dot-done { background: #4ade80; }
       @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-
-      /* Log */
-      .log-entry { padding: 8px 12px; border-bottom: 1px solid #1a1a2e; font-size: 0.8rem; font-family: monospace; word-break: break-word; }
-      .log-time { color: #666; }
-      .log-action { color: #6366f1; }
-      .log-booked { color: #22c55e; }
-      .log-error { color: #ef4444; }
 
       .loading { text-align: center; padding: 40px; color: #666; }
       .empty { text-align: center; padding: 30px; color: #555; font-size: 0.9rem; }
@@ -137,7 +130,6 @@
         .watchlist-item { grid-template-columns: 1fr auto; gap: 4px; }
         .wl-date, .wl-time, .wl-header-date, .wl-header-time { display: none; }
 
-        .log-entry { font-size: 0.7rem; padding: 6px 8px; }
       }
     </style>
   </head>
@@ -148,7 +140,6 @@
       <div class="tabs">
         <div class="tab active" data-tab="classes">Classes</div>
         <div class="tab" data-tab="watchlist">Watchlist <span id="watchCount"></span></div>
-        <div class="tab" data-tab="log">Log</div>
       </div>
 
       <div id="classes" class="tab-content active">
@@ -170,13 +161,6 @@
         <div id="watchlistContent"><div class="loading">Loading...</div></div>
       </div>
 
-      <div id="log" class="tab-content">
-        <div class="nav-bar">
-          <span style="color:#666; font-size:0.8rem;">Activity log</span>
-          <button class="btn-nav" onclick="fetchLog()">Refresh</button>
-        </div>
-        <div id="logContent"><div class="loading">Loading...</div></div>
-      </div>
     </div>
 
     <div class="toast" id="toast"></div>
@@ -190,7 +174,6 @@
           tab.classList.add('active');
           document.getElementById(tab.dataset.tab).classList.add('active');
           if (tab.dataset.tab === 'watchlist') fetchWatchlist();
-          if (tab.dataset.tab === 'log') fetchLog();
         });
       });
 
@@ -258,9 +241,6 @@
             html += `<div class="day-header">${currentDay}</div>`;
           }
 
-          const spotsClass = cls.open > 0 ? 'open' : cls.has_signup ? 'full' : 'unknown';
-          const spotsText = cls.has_signup ? `${cls.open} open` : 'Not yet open';
-
           // Check if class is in the past
           let isPast = false;
           if (cls.class_date) {
@@ -270,6 +250,9 @@
               isPast = clsDt < new Date();
             } catch(e) {}
           }
+
+          const spotsClass = isPast ? 'unknown' : cls.open > 0 ? 'open' : cls.has_signup ? 'full' : 'unknown';
+          const spotsText = isPast ? '' : cls.has_signup ? `${cls.open} open` : 'Not yet open';
 
           let actionBtn = '';
           if (isPast) {
@@ -387,7 +370,7 @@
         }
 
         let html = `<div class="watchlist-item" style="color:#555; font-size:0.75rem; font-weight:600; border-bottom:1px solid #333;">
-          <div>Class</div><div class="wl-header-date">Date</div><div class="wl-header-time">Opens</div><div>Status</div><div></div>
+          <div>Class</div><div class="wl-header-date">Date</div><div class="wl-header-time">Opens</div><div></div>
         </div>`;
 
         for (const w of list) {
@@ -421,8 +404,7 @@
                 <span style="color:#888;font-size:0.75rem;">${w.teacher||''} · ${w.time || ''}</span>
               </div>
               <div class="wl-date">${w.date_label || w.class_date || ''}</div>
-              <div class="wl-time">${opensHtml}</div>
-              <div><span class="phase-dot ${dotClass}"></span><span class="wl-status ${statusClass}">${phaseLabel}</span></div>
+              <div class="wl-time"><span class="phase-dot ${dotClass}"></span>${opensHtml}</div>
               <div style="text-align:right;">${rm}</div>
             </div>`;
         }
@@ -437,31 +419,6 @@
           });
           showToast('Removed'); fetchWatchlist(); fetchClasses();
         } catch (e) { showToast('Error: ' + e.message); }
-      }
-
-      // --- Log ---
-      async function fetchLog() {
-        try {
-          const res = await fetch('/api/log');
-          const log = await res.json();
-          renderLog(log);
-        } catch (e) {
-          document.getElementById('logContent').innerHTML = '<div class="loading">Error</div>';
-        }
-      }
-
-      function renderLog(log) {
-        const el = document.getElementById('logContent');
-        if (!log.length) { el.innerHTML = '<div class="empty">No activity yet.<br>Scheduler checks every 30 seconds.</div>'; return; }
-
-        let html = '';
-        for (const entry of log) {
-          const time = new Date(entry.time).toLocaleString();
-          const cls = entry.action === 'booked' ? 'log-booked' : entry.action.includes('error') ? 'log-error' : 'log-action';
-          const detail = entry.result || entry.error || entry.class || '';
-          html += `<div class="log-entry"><span class="log-time">${time}</span> <span class="${cls}">[${entry.action}]</span> ${detail}</div>`;
-        }
-        el.innerHTML = html;
       }
 
       // --- Init ---
