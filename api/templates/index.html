@@ -328,17 +328,45 @@
       }
 
       // --- Watchlist ---
+      let _watchlistData = [];
+      let _countdownInterval = null;
+
       async function fetchWatchlist() {
         try {
           const res = await fetch('/api/watchlist');
-          const list = await res.json();
-          renderWatchlist(list);
-          const waiting = list.filter(w => w.status === 'waiting').length;
+          _watchlistData = await res.json();
+          renderWatchlist(_watchlistData);
+          startCountdown();
+          const waiting = _watchlistData.filter(w => w.status === 'waiting').length;
           document.getElementById('watchCount').textContent = waiting ? `(${waiting})` : '';
         } catch (e) {
           document.getElementById('watchlistContent').innerHTML =
             '<div class="loading" style="color:#ef4444;">Error</div>';
         }
+      }
+
+      function formatCountdown(seconds) {
+        if (seconds <= 0) return 'now';
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = Math.floor(seconds % 60);
+        if (d > 0) return `${d}d ${h}h ${m}m ${s}s`;
+        if (h > 0) return `${h}h ${m}m ${s}s`;
+        if (m > 0) return `${m}m ${s}s`;
+        return `${s}s`;
+      }
+
+      function startCountdown() {
+        if (_countdownInterval) clearInterval(_countdownInterval);
+        _countdownInterval = setInterval(() => {
+          const els = document.querySelectorAll('[data-open-time]');
+          els.forEach(el => {
+            const openTime = new Date(el.dataset.openTime);
+            const diff = (openTime - new Date()) / 1000;
+            el.textContent = formatCountdown(diff);
+          });
+        }, 1000);
       }
 
       function renderWatchlist(list) {
@@ -354,10 +382,19 @@
 
         for (const w of list) {
           const sc = w.status === 'booked' ? 'status-booked' : w.status === 'snagged' ? 'status-booked' : 'status-waiting';
-          let st = w.status === 'booked' || w.status === 'snagged' ? 'Booked' : 'Waiting';
-          if (w.status === 'waiting' && w.opens_in) {
-            st = `in ${w.opens_in}`;
+          let statusHtml;
+          if (w.status === 'booked' || w.status === 'snagged') {
+            statusHtml = `<span class="wl-status status-booked">Booked</span>`;
+          } else {
+            statusHtml = `<span class="wl-status status-waiting">Waiting</span>`;
           }
+
+          let opensHtml = '?';
+          if (w.open_time) {
+            const diff = (new Date(w.open_time) - new Date()) / 1000;
+            opensHtml = `<span data-open-time="${w.open_time}">${formatCountdown(diff)}</span>`;
+          }
+
           const rm = w.status !== 'booked'
             ? `<button class="btn-unwatch btn-small" onclick="unwatchByEntry(${JSON.stringify(w).replace(/"/g,'&quot;')})">Remove</button>` : '';
 
@@ -368,8 +405,8 @@
                 <span style="color:#888;font-size:0.75rem;">${w.teacher||''} · ${w.time || ''}</span>
               </div>
               <div class="wl-date">${w.date_label || w.class_date || ''}</div>
-              <div class="wl-time">${w.opens_in || '?'}</div>
-              <div><span class="wl-status ${sc}">${st}</span></div>
+              <div class="wl-time">${opensHtml}</div>
+              <div>${statusHtml}</div>
               <div style="text-align:right;">${rm}</div>
             </div>`;
         }
