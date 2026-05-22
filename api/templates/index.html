@@ -253,8 +253,20 @@
           const spotsClass = cls.open > 0 ? 'open' : cls.has_signup ? 'full' : 'unknown';
           const spotsText = cls.has_signup ? `${cls.open} open` : 'Not yet open';
 
+          // Check if class is in the past
+          let isPast = false;
+          if (cls.class_date) {
+            try {
+              const timeClean = cls.time.replace(/\u00a0/g, ' ').replace(/\s+[A-Z]{2,4}$/, '').trim();
+              const clsDt = new Date(cls.class_date + ' ' + timeClean);
+              isPast = clsDt < new Date();
+            } catch(e) {}
+          }
+
           let actionBtn = '';
-          if (cls.has_signup && cls.class_id && cls.open > 0) {
+          if (isPast) {
+            actionBtn = '';
+          } else if (cls.has_signup && cls.class_id && cls.open > 0) {
             actionBtn = `<button class="btn-book btn-small" onclick="bookClass('${cls.class_id}','${cls.class_date}')">Book</button>`;
           } else if (cls.has_signup && cls.class_id && cls.open === 0) {
             actionBtn = `<button class="btn-small" disabled style="background:#333;color:#666;cursor:not-allowed;">Full</button>`;
