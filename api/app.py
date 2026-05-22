@@ -468,6 +468,34 @@ def api_log():
     return jsonify(load_log())
 
 
+@app.route("/api/upload-cookies", methods=["POST"])
+def api_upload_cookies():
+    """Upload cookies from local login to Railway's persistent storage."""
+    global _session
+    data = request.json
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "POST a JSON dict of cookies"}), 400
+
+    # Save to persistent volume
+    from bot import COOKIE_JAR_FILE
+    with open(COOKIE_JAR_FILE, "w") as f:
+        json.dump(data, f)
+
+    # Apply to current session
+    with _session_lock:
+        import requests as req
+        _session = req.Session()
+        _session.headers.update(HEADERS)
+        apply_cookies(_session, data)
+
+    cookie_names = list(data.keys())
+    has_auth = "idsrvauth" in cookie_names
+    print(f"[upload-cookies] Received {len(data)} cookies. Has idsrvauth: {has_auth}")
+    print(f"[upload-cookies] Cookie names: {cookie_names}")
+
+    return jsonify({"status": "ok", "cookies": len(data), "has_idsrvauth": has_auth})
+
+
 # --- Scheduler startup ---
 scheduler = BackgroundScheduler()
 
