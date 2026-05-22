@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Class Snagger</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; }
+
+        .container { max-width: 1100px; margin: 0 auto; padding: 20px; }
+
+        h1 { font-size: 1.8rem; margin-bottom: 4px; color: #fff; }
+        .subtitle { color: #888; margin-bottom: 24px; font-size: 0.9rem; }
+
+        .tabs { display: flex; gap: 0; margin-bottom: 20px; border-bottom: 1px solid #333; }
+        .tab { padding: 10px 20px; cursor: pointer; color: #888; border-bottom: 2px solid transparent; transition: all 0.2s; }
+        .tab:hover { color: #ccc; }
+        .tab.active { color: #fff; border-bottom-color: #6366f1; }
+
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        .day-header { padding: 12px 0 6px; font-weight: 600; font-size: 1.05rem; color: #a5b4fc; border-bottom: 1px solid #1e1e2e; margin-top: 16px; }
+        .day-header:first-child { margin-top: 0; }
+
+        .class-row {
+            display: grid;
+            grid-template-columns: 130px 1fr 160px 80px 100px;
+            align-items: center;
+            padding: 10px 12px;
+            border-bottom: 1px solid #1a1a2e;
+            transition: background 0.15s;
+        }
+        .class-row:hover { background: #151525; }
+
+        .class-time { color: #94a3b8; font-size: 0.9rem; font-variant-numeric: tabular-nums; }
+        .class-name { font-weight: 500; }
+        .class-teacher { color: #888; font-size: 0.85rem; }
+        .class-spots { font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+        .class-spots.full { color: #ef4444; }
+        .class-spots.open { color: #22c55e; }
+        .class-spots.unknown { color: #666; }
+
+        .class-actions { text-align: right; }
+
+        button {
+            padding: 6px 14px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 500;
+            transition: all 0.15s;
+        }
+
+        .btn-book { background: #22c55e; color: #000; }
+        .btn-book:hover { background: #16a34a; }
+        .btn-book:disabled { background: #333; color: #666; cursor: not-allowed; }
+
+        .btn-watch { background: #6366f1; color: #fff; }
+        .btn-watch:hover { background: #4f46e5; }
+
+        .btn-unwatch { background: #ef4444; color: #fff; }
+        .btn-unwatch:hover { background: #dc2626; }
+
+        .btn-small { padding: 4px 10px; font-size: 0.75rem; }
+
+        .watchlist-item {
+            display: grid;
+            grid-template-columns: 1fr 150px 140px 100px 100px;
+            align-items: center;
+            padding: 12px;
+            border-bottom: 1px solid #1a1a2e;
+        }
+
+        .status { padding: 3px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; display: inline-block; }
+        .status-waiting { background: #1e1b4b; color: #a5b4fc; }
+        .status-booked { background: #052e16; color: #4ade80; }
+
+        .log-entry { padding: 8px 12px; border-bottom: 1px solid #1a1a2e; font-size: 0.85rem; font-family: monospace; }
+        .log-time { color: #666; }
+        .log-action { color: #6366f1; }
+        .log-booked { color: #22c55e; }
+        .log-error { color: #ef4444; }
+
+        .loading { text-align: center; padding: 40px; color: #666; }
+        .refresh-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+        .refresh-bar button { background: #1e1e2e; color: #ccc; border: 1px solid #333; }
+        .refresh-bar button:hover { background: #2a2a3e; }
+
+        .toast {
+            position: fixed; bottom: 20px; right: 20px; padding: 12px 20px;
+            background: #1e1e2e; border: 1px solid #333; border-radius: 8px;
+            color: #fff; font-size: 0.9rem; z-index: 100;
+            opacity: 0; transition: opacity 0.3s; pointer-events: none;
+        }
+        .toast.show { opacity: 1; }
+
+        @media (max-width: 768px) {
+            .class-row { grid-template-columns: 90px 1fr 60px; gap: 4px; }
+            .class-teacher, .class-spots { display: none; }
+            .watchlist-item { grid-template-columns: 1fr 80px 80px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Class Snagger</h1>
+        <p class="subtitle">Auto-book classes the moment signup opens</p>
+
+        <div class="tabs">
+            <div class="tab active" data-tab="classes">All Classes</div>
+            <div class="tab" data-tab="watchlist">Watchlist <span id="watchCount"></span></div>
+            <div class="tab" data-tab="log">Log</div>
+        </div>
+
+        <div id="classes" class="tab-content active">
+            <div class="refresh-bar">
+                <span id="classStatus" style="color: #666; font-size: 0.85rem;"></span>
+                <button onclick="fetchClasses()">Refresh</button>
+            </div>
+            <div id="classList"><div class="loading">Loading classes...</div></div>
+        </div>
+
+        <div id="watchlist" class="tab-content">
+            <div id="watchlistContent"><div class="loading">Loading watchlist...</div></div>
+        </div>
+
+        <div id="log" class="tab-content">
+            <div class="refresh-bar">
+                <span style="color: #666; font-size: 0.85rem;">Booking activity log</span>
+                <button onclick="fetchLog()">Refresh</button>
+            </div>
+            <div id="logContent"><div class="loading">Loading log...</div></div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        // --- Tabs ---
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById(tab.dataset.tab).classList.add('active');
+
+                if (tab.dataset.tab === 'watchlist') fetchWatchlist();
+                if (tab.dataset.tab === 'log') fetchLog();
+            });
+        });
+
+        // --- Toast ---
+        function showToast(msg) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.classList.add('show');
+            setTimeout(() => t.classList.remove('show'), 3000);
+        }
+
+        // --- Classes ---
+        let allClasses = [];
+
+        async function fetchClasses() {
+            document.getElementById('classList').innerHTML = '<div class="loading">Loading classes...</div>';
+            try {
+                const res = await fetch('/api/classes');
+                allClasses = await res.json();
+                if (allClasses.error) throw new Error(allClasses.error);
+                renderClasses(allClasses);
+                document.getElementById('classStatus').textContent = `${allClasses.length} classes loaded`;
+            } catch (e) {
+                document.getElementById('classList').innerHTML = `<div class="loading" style="color:#ef4444;">Error: ${e.message}</div>`;
+            }
+        }
+
+        function renderClasses(classes) {
+            const el = document.getElementById('classList');
+            if (!classes.length) { el.innerHTML = '<div class="loading">No classes found</div>'; return; }
+
+            let html = '';
+            let currentDay = '';
+            for (const cls of classes) {
+                if (cls.date !== currentDay) {
+                    currentDay = cls.date;
+                    html += `<div class="day-header">${currentDay}</div>`;
+                }
+
+                const spotsClass = cls.open > 0 ? 'open' : (cls.has_signup ? 'full' : 'unknown');
+                const spotsText = cls.has_signup
+                    ? `${cls.open} open`
+                    : 'Not yet open';
+
+                let actionBtn = '';
+                if (cls.has_signup && cls.class_id) {
+                    actionBtn = `<button class="btn-book btn-small" onclick="bookClass('${cls.class_id}', '${cls.class_date}')">Book Now</button>`;
+                } else if (cls.watched) {
+                    actionBtn = `<button class="btn-unwatch btn-small" onclick="unwatchClass(${JSON.stringify(cls).replace(/"/g, '&quot;')})">Watching</button>`;
+                } else {
+                    actionBtn = `<button class="btn-watch btn-small" onclick="watchClass(${JSON.stringify(cls).replace(/"/g, '&quot;')})">Watch</button>`;
+                }
+
+                html += `
+                    <div class="class-row">
+                        <div class="class-time">${cls.time}</div>
+                        <div class="class-name">${cls.name}</div>
+                        <div class="class-teacher">${cls.teacher}</div>
+                        <div class="class-spots ${spotsClass}">${spotsText}</div>
+                        <div class="class-actions">${actionBtn}</div>
+                    </div>`;
+            }
+            el.innerHTML = html;
+        }
+
+        async function bookClass(classId, classDate) {
+            if (!confirm('Book this class now?')) return;
+            showToast('Booking...');
+            try {
+                const res = await fetch('/api/book', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({class_id: classId, class_date: classDate}),
+                });
+                const data = await res.json();
+                showToast(data.result || data.error || 'Done');
+                fetchClasses();
+            } catch (e) {
+                showToast('Error: ' + e.message);
+            }
+        }
+
+        async function watchClass(cls) {
+            try {
+                const res = await fetch('/api/watch', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(cls),
+                });
+                const data = await res.json();
+                if (data.status === 'already_watched') {
+                    showToast('Already watching this class');
+                } else {
+                    showToast('Added to watchlist');
+                }
+                fetchClasses();
+                fetchWatchlist();
+            } catch (e) {
+                showToast('Error: ' + e.message);
+            }
+        }
+
+        async function unwatchClass(cls) {
+            try {
+                await fetch('/api/unwatch', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(cls),
+                });
+                showToast('Removed from watchlist');
+                fetchClasses();
+                fetchWatchlist();
+            } catch (e) {
+                showToast('Error: ' + e.message);
+            }
+        }
+
+        // --- Watchlist ---
+        async function fetchWatchlist() {
+            try {
+                const res = await fetch('/api/watchlist');
+                const list = await res.json();
+                renderWatchlist(list);
+                const waiting = list.filter(w => w.status === 'waiting').length;
+                document.getElementById('watchCount').textContent = waiting ? `(${waiting})` : '';
+            } catch (e) {
+                document.getElementById('watchlistContent').innerHTML = `<div class="loading" style="color:#ef4444;">Error</div>`;
+            }
+        }
+
+        function renderWatchlist(list) {
+            const el = document.getElementById('watchlistContent');
+            if (!list.length) { el.innerHTML = '<div class="loading">No watched classes. Select classes from the schedule to auto-book.</div>'; return; }
+
+            let html = `<div class="watchlist-item" style="color:#666; font-size:0.8rem; font-weight:600; border-bottom:1px solid #333;">
+                <div>Class</div><div>Date</div><div>Time</div><div>Status</div><div></div>
+            </div>`;
+
+            for (const w of list) {
+                const statusClass = w.status === 'booked' ? 'status-booked' : 'status-waiting';
+                const statusText = w.status === 'booked' ? 'Booked' : 'Waiting';
+                const removeBtn = w.status !== 'booked'
+                    ? `<button class="btn-unwatch btn-small" onclick="unwatchByEntry(${JSON.stringify(w).replace(/"/g, '&quot;')})">Remove</button>`
+                    : '';
+
+                html += `
+                    <div class="watchlist-item">
+                        <div><strong>${w.class_name}</strong><br><span style="color:#888; font-size:0.8rem;">${w.teacher || ''}</span></div>
+                        <div>${w.date_label || w.class_date || ''}</div>
+                        <div>${w.time || ''}</div>
+                        <div><span class="status ${statusClass}">${statusText}</span></div>
+                        <div style="text-align:right;">${removeBtn}</div>
+                    </div>`;
+            }
+            el.innerHTML = html;
+        }
+
+        async function unwatchByEntry(w) {
+            try {
+                await fetch('/api/unwatch', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name: w.class_name, class_date: w.class_date, time: w.time}),
+                });
+                showToast('Removed from watchlist');
+                fetchWatchlist();
+                fetchClasses();
+            } catch (e) {
+                showToast('Error: ' + e.message);
+            }
+        }
+
+        // --- Log ---
+        async function fetchLog() {
+            try {
+                const res = await fetch('/api/log');
+                const log = await res.json();
+                renderLog(log);
+            } catch (e) {
+                document.getElementById('logContent').innerHTML = '<div class="loading">Error loading log</div>';
+            }
+        }
+
+        function renderLog(log) {
+            const el = document.getElementById('logContent');
+            if (!log.length) { el.innerHTML = '<div class="loading">No activity yet. The scheduler checks every 30 seconds.</div>'; return; }
+
+            let html = '';
+            for (const entry of log) {
+                const time = new Date(entry.time).toLocaleString();
+                const cls = entry.action === 'booked' ? 'log-booked' : entry.action.includes('error') ? 'log-error' : 'log-action';
+                const detail = entry.result || entry.error || entry.class || '';
+                html += `<div class="log-entry"><span class="log-time">${time}</span> <span class="${cls}">[${entry.action}]</span> ${detail}</div>`;
+            }
+            el.innerHTML = html;
+        }
+
+        // --- Init ---
+        fetchClasses();
+        fetchWatchlist();
+    </script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+flask
+apscheduler
+cloudscraper
+beautifulsoup4
