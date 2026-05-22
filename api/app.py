@@ -334,16 +334,30 @@ def api_classes():
 @app.route("/api/watchlist")
 def api_watchlist():
     watchlist = load_watchlist()
-    # Enrich with computed open times
+    now = datetime.now()
+    # Enrich with computed open times and scheduler info
     for w in watchlist:
         class_dt = parse_class_datetime(w.get("class_date", ""), w.get("time", ""))
         if class_dt:
             open_time = compute_open_time(class_dt)
+            reauth_time = compute_reauth_time(open_time)
             w["open_time"] = open_time.isoformat()
-            w["opens_in"] = str(open_time - datetime.now()).split(".")[0] if open_time > datetime.now() else "now"
+            w["reauth_time"] = reauth_time.isoformat()
+            w["opens_in"] = str(open_time - now).split(".")[0] if open_time > now else "now"
+            # Scheduler phase
+            if w.get("status") == "booked" or w.get("status") == "snagged":
+                w["phase"] = "done"
+            elif now >= open_time:
+                w["phase"] = "booking"
+            elif now >= reauth_time:
+                w["phase"] = "reauth"
+            else:
+                w["phase"] = "scheduled"
         else:
             w["open_time"] = None
+            w["reauth_time"] = None
             w["opens_in"] = "?"
+            w["phase"] = "unknown"
     return jsonify(watchlist)
 
 

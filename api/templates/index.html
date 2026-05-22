@@ -91,6 +91,14 @@
       .wl-status { padding: 3px 10px; border-radius: 12px; font-size: 0.72rem; font-weight: 600; display: inline-block; }
       .status-waiting { background: #1e1b4b; color: #a5b4fc; }
       .status-booked { background: #052e16; color: #4ade80; }
+      .status-reauth { background: #422006; color: #fbbf24; }
+      .status-booking { background: #1e1b4b; color: #818cf8; animation: pulse 1.5s infinite; }
+      .phase-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 5px; }
+      .dot-scheduled { background: #6366f1; }
+      .dot-reauth { background: #fbbf24; }
+      .dot-booking { background: #22c55e; animation: pulse 1s infinite; }
+      .dot-done { background: #4ade80; }
+      @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
       /* Log */
       .log-entry { padding: 8px 12px; border-bottom: 1px solid #1a1a2e; font-size: 0.8rem; font-family: monospace; word-break: break-word; }
@@ -276,8 +284,10 @@
             actionBtn = `<button class="btn-watch btn-small" onclick="watchClass(${JSON.stringify(cls).replace(/"/g,'&quot;')})">Watch</button>`;
           }
 
+          const rowStyle = isPast ? 'opacity:0.35;' : '';
+
           html += `
-            <div class="class-row">
+            <div class="class-row" style="${rowStyle}">
               <div>
                 <div class="class-time">${cls.time}</div>
                 <div class="class-name">${cls.name}</div>
@@ -381,12 +391,18 @@
         </div>`;
 
         for (const w of list) {
-          const sc = w.status === 'booked' ? 'status-booked' : w.status === 'snagged' ? 'status-booked' : 'status-waiting';
-          let statusHtml;
-          if (w.status === 'booked' || w.status === 'snagged') {
-            statusHtml = `<span class="wl-status status-booked">Booked</span>`;
-          } else {
-            statusHtml = `<span class="wl-status status-waiting">Waiting</span>`;
+          // Phase indicator
+          const phase = w.phase || 'unknown';
+          let dotClass = 'dot-scheduled';
+          let phaseLabel = 'Scheduled';
+          let statusClass = 'status-waiting';
+
+          if (phase === 'done' || w.status === 'booked' || w.status === 'snagged') {
+            dotClass = 'dot-done'; phaseLabel = 'Booked'; statusClass = 'status-booked';
+          } else if (phase === 'booking') {
+            dotClass = 'dot-booking'; phaseLabel = 'Booking...'; statusClass = 'status-booking';
+          } else if (phase === 'reauth') {
+            dotClass = 'dot-reauth'; phaseLabel = 'Re-auth'; statusClass = 'status-reauth';
           }
 
           let opensHtml = '?';
@@ -395,7 +411,7 @@
             opensHtml = `<span data-open-time="${w.open_time}">${formatCountdown(diff)}</span>`;
           }
 
-          const rm = w.status !== 'booked'
+          const rm = w.status !== 'booked' && w.status !== 'snagged'
             ? `<button class="btn-unwatch btn-small" onclick="unwatchByEntry(${JSON.stringify(w).replace(/"/g,'&quot;')})">Remove</button>` : '';
 
           html += `
@@ -406,7 +422,7 @@
               </div>
               <div class="wl-date">${w.date_label || w.class_date || ''}</div>
               <div class="wl-time">${opensHtml}</div>
-              <div>${statusHtml}</div>
+              <div><span class="phase-dot ${dotClass}"></span><span class="wl-status ${statusClass}">${phaseLabel}</span></div>
               <div style="text-align:right;">${rm}</div>
             </div>`;
         }

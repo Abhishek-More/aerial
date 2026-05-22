@@ -316,24 +316,7 @@ def parse_classes(html: str) -> list[dict]:
             "class_date": class_date,
         })
 
-    # Filter out classes in the past
-    from datetime import datetime as _dt2
-    now = _dt2.now()
-    future_classes = []
-    for cls in classes:
-        if not cls["class_date"]:
-            future_classes.append(cls)
-            continue
-        try:
-            # Normalize: replace &nbsp; and extra whitespace, strip timezone
-            time_clean = re.sub(r"[\xa0\s]+", " ", cls["time"]).strip()
-            time_clean = re.sub(r"\s+[A-Z]{2,4}$", "", time_clean).strip()
-            cls_dt = _dt2.strptime(f"{cls['class_date']} {time_clean}", "%m/%d/%Y %I:%M %p")
-            if cls_dt >= now:
-                future_classes.append(cls)
-        except ValueError as e:
-            future_classes.append(cls)
-    return future_classes
+    return classes
 
 
 def signup_for_class(session: requests.Session, class_id: str, class_date: str, tg: str = "28", cls_loc: str = "1") -> str:
