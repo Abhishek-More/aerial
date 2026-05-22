@@ -342,9 +342,9 @@ def signup_for_class(session: requests.Session, class_id: str, class_date: str, 
         print(f"[book] Class is full!")
         return f"Class {class_id} on {class_date} is FULL."
 
-    # Check for session issues
-    if "resetsession" in resp.text.lower():
-        print(f"[book] Session expired during booking!")
+    # Check for session issues — if we got redirected to the login page (su1.asp)
+    if "/su1.asp" in resp.url:
+        print(f"[book] Session expired — redirected to login: {resp.url}")
         return f"Session expired. Please refresh and try again."
 
     # Step 2: Hit res_deb.asp to confirm the booking
