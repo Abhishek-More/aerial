@@ -28,7 +28,9 @@ def get_bot_session():
     global _session
     with _session_lock:
         if _session is None:
+            print("[app] Initializing bot session (first time)...")
             _session = get_session()
+            print("[app] Bot session ready.")
         return _session
 
 
@@ -40,11 +42,15 @@ def get_cached_classes(date="", location="1", category="28", force=False):
     with _cache_lock:
         cached = _class_cache.get(cache_key)
         if cached and not force and (now - cached["fetched_at"]) < CACHE_TTL:
+            age = int(now - cached["fetched_at"])
+            print(f"[cache] HIT for {cache_key} (age: {age}s, {len(cached['classes'])} classes)")
             return cached["classes"]
 
-    # Fetch outside the lock to avoid blocking other requests
+    print(f"[cache] MISS for {cache_key}, force={force}. Fetching from MindBody...")
     session = get_bot_session()
+    print(f"[cache] Session ready. Fetching classes...")
     classes = get_classes(session, date=date, location=location, class_type=category)
+    print(f"[cache] Fetched {len(classes)} classes")
 
     with _cache_lock:
         _class_cache[cache_key] = {"classes": classes, "fetched_at": _time.time()}
@@ -54,11 +60,12 @@ def get_cached_classes(date="", location="1", category="28", force=False):
 
 def refresh_default_cache():
     """Background job: keep the default view warm."""
+    print(f"[scheduler] Cache refresh starting...")
     try:
-        get_cached_classes(date="", location="1", category="28", force=True)
-        print(f"[{datetime.now()}] Cache refreshed")
+        classes = get_cached_classes(date="", location="1", category="28", force=True)
+        print(f"[scheduler] Cache refreshed: {len(classes)} classes")
     except Exception as e:
-        print(f"[{datetime.now()}] Cache refresh error: {e}")
+        print(f"[scheduler] Cache refresh error: {type(e).__name__}: {e}")
 
 
 def load_watchlist() -> list[dict]:

@@ -46,8 +46,9 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
     """
     from playwright.sync_api import sync_playwright
 
-    print("Launching headless browser for login...")
+    print("[login] Launching headless browser...")
     with sync_playwright() as p:
+        print("[login] Starting Chromium...")
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent=HEADERS["User-Agent"],
@@ -55,32 +56,47 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
         )
         page = context.new_page()
 
-        # Step 1: Navigate to the studio page — Cloudflare challenge is solved by the real browser
+        # Step 1: Navigate to the studio page
+        print(f"[login] Navigating to {BASE_URL}/classic/ws?studioid=836167")
         page.goto(f"{BASE_URL}/classic/ws?studioid=836167", wait_until="networkidle", timeout=60000)
+        print(f"[login] Page loaded. URL: {page.url}")
+        print(f"[login] Page title: {page.title()}")
 
         # Step 2: Fill in login form
-        # Wait for the login form to appear
+        print("[login] Waiting for login form (#su1UserName)...")
         page.wait_for_selector("#su1UserName", timeout=30000)
+        print("[login] Login form found. Filling credentials...")
         page.fill("#su1UserName", email)
         page.fill("#su1Password", password)
 
-        # Click the login button
+        print("[login] Clicking login button...")
         page.click("#btnSu1Login")
 
-        # Step 3: Wait for login to complete — look for "signed in" text
+        # Step 3: Wait for login to complete
+        print("[login] Waiting for login response...")
         try:
             page.wait_for_selector("#top-wel-sp", timeout=30000)
-            print("Browser login successful!")
-        except Exception:
-            # Check if we're on a different page that indicates success
-            if "signed in" in page.content().lower():
-                print("Browser login successful!")
+            print("[login] Login successful — welcome message found")
+        except Exception as e:
+            content = page.content().lower()
+            print(f"[login] #top-wel-sp not found: {e}")
+            print(f"[login] Current URL: {page.url}")
+            print(f"[login] Page has 'signed in': {'signed in' in content}")
+            print(f"[login] Page length: {len(content)} chars")
+            if "signed in" in content:
+                print("[login] Login successful (fallback check)")
             else:
+                # Save page content for debugging
+                snippet = page.content()[:1000]
+                print(f"[login] Page snippet: {snippet}")
                 browser.close()
-                raise RuntimeError(f"Browser login failed. Page URL: {page.url}")
+                raise RuntimeError(f"Browser login failed. URL: {page.url}")
 
         # Step 4: Extract all cookies
         browser_cookies = context.cookies()
+        print(f"[login] Extracted {len(browser_cookies)} cookies")
+        cookie_names = [c["name"] for c in browser_cookies]
+        print(f"[login] Cookie names: {cookie_names}")
         browser.close()
 
     # Convert to dict
@@ -102,12 +118,19 @@ def apply_cookies(session: requests.Session, cookies: dict):
 
 def check_session(session: requests.Session) -> bool:
     """Check if the current session is still valid."""
+    print("[session] Checking if session is valid...")
     try:
         resp = session.get(f"{BASE_URL}/classic/mainclass?fl=true&tabID=7", allow_redirects=False, timeout=15)
-        if resp.status_code == 200 and "resetSession" not in resp.text and "classSchedule" in resp.text:
+        print(f"[session] Status: {resp.status_code}, length: {len(resp.text)}")
+        has_reset = "resetSession" in resp.text
+        has_schedule = "classSchedule" in resp.text
+        print(f"[session] Has resetSession: {has_reset}, has classSchedule: {has_schedule}")
+        if resp.status_code == 200 and not has_reset and has_schedule:
+            print("[session] Session is valid!")
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[session] Check failed: {e}")
+    print("[session] Session is invalid or expired.")
     return False
 
 
@@ -121,18 +144,25 @@ def get_credentials() -> tuple[str, str]:
 
 
 def get_session() -> requests.Session:
+    print("[get_session] Creating new session...")
     session = requests.Session()
     session.headers.update(HEADERS)
 
     # Try 1: Load saved cookie jar from last successful session
-    if load_cookie_jar(session) and check_session(session):
-        print("Restored session from saved cookies.")
+    print("[get_session] Try 1: Loading saved cookie jar...")
+    jar_loaded = load_cookie_jar(session)
+    print(f"[get_session] Cookie jar loaded: {jar_loaded}, cookies: {len(session.cookies)}")
+    if jar_loaded and check_session(session):
+        print("[get_session] Restored session from saved cookies.")
         return session
 
     # Try 2: Log in with playwright (bypasses Cloudflare)
+    print("[get_session] Try 2: Logging in with playwright...")
     session.cookies.clear()
     email, password = get_credentials()
+    print(f"[get_session] Credentials loaded for: {email}")
     cookies = login_with_playwright(email, password)
+    print(f"[get_session] Got {len(cookies)} cookies from browser")
 
     # Apply cookies to requests session
     apply_cookies(session, cookies)
@@ -140,9 +170,10 @@ def get_session() -> requests.Session:
     # Save for next time
     with open(COOKIE_JAR_FILE, "w") as f:
         json.dump(cookies, f)
+    print("[get_session] Cookie jar saved")
 
     if check_session(session):
-        print("Session established via browser login.")
+        print("[get_session] Session established via browser login.")
         return session
 
     raise RuntimeError("Login succeeded in browser but session check failed.")
