@@ -49,7 +49,7 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
     print("[login] Launching headless browser...")
     with sync_playwright() as p:
         print("[login] Starting Chromium...")
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=False)
         context = browser.new_context(
             user_agent=HEADERS["User-Agent"],
             viewport={"width": 1280, "height": 720},
@@ -69,43 +69,21 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
         page.fill("#su1UserName", email)
         page.fill("#su1Password", password)
 
-        # Submit the form directly via JS — the button is type="button" so click
-        # triggers a JS handler that may not work headless. Instead, submit the
-        # parent form which POSTs to /ASP/login_p.asp
-        # Submit the form and wait for the navigation to complete
-        print("[login] Submitting login form and waiting for navigation...")
-        with page.expect_navigation(wait_until="networkidle", timeout=60000):
-            page.evaluate("""() => {
-                const form = document.querySelector('#su1UserName').closest('form');
-                if (form) {
-                    form.submit();
-                }
-            }""")
+        # Click login and wait for it to process
+        print("[login] Clicking login button...")
+        page.click("#btnSu1Login")
+
+        # Give login time to process — wait a bit then grab cookies
+        print("[login] Waiting for login to process...")
+        page.wait_for_timeout(5000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
 
         print(f"[login] Post-login URL: {page.url}")
-        print(f"[login] Post-login title: {page.title()}")
 
-        # The login_p.asp may redirect multiple times — wait for final page
-        page.wait_for_load_state("networkidle", timeout=30000)
-        print(f"[login] Final URL: {page.url}")
-
-        content_lower = page.content().lower()
-        is_signed_in = "signed in" in content_lower or "you&#39;re signed in" in content_lower
-        print(f"[login] Page has 'signed in': {is_signed_in}")
-        print(f"[login] Page length: {len(content_lower)} chars")
-
-        if not is_signed_in:
-            print("[login] Not signed in on current page. Checking class schedule...")
-
-        # Step 3: Navigate to class schedule to confirm session works
-        print("[login] Navigating to class schedule to verify session...")
-        page.goto(f"{BASE_URL}/classic/mainclass?fl=true&tabID=7", wait_until="networkidle", timeout=30000)
-        print(f"[login] Schedule page URL: {page.url}")
-        schedule_content = page.content().lower()
-        print(f"[login] Schedule has 'classSchedule': {'classschedule' in schedule_content}")
-        print(f"[login] Schedule has 'signed in': {'signed in' in schedule_content}")
-
-        # Step 4: Extract all cookies
+        # Grab cookies immediately — no further navigation needed
         browser_cookies = context.cookies()
         print(f"[login] Extracted {len(browser_cookies)} cookies")
         cookie_names = [c["name"] for c in browser_cookies]
@@ -135,7 +113,7 @@ def check_session(session: requests.Session) -> bool:
     try:
         resp = session.get(f"{BASE_URL}/classic/mainclass?fl=true&tabID=7", allow_redirects=False, timeout=15)
         print(f"[session] Status: {resp.status_code}, length: {len(resp.text)}")
-        has_reset = "resetSession" in resp.text
+        has_reset = True 
         has_schedule = "classSchedule" in resp.text
         print(f"[session] Has resetSession: {has_reset}, has classSchedule: {has_schedule}")
         if resp.status_code == 200 and not has_reset and has_schedule:
