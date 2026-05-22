@@ -305,11 +305,14 @@ def api_log():
 
 
 # Start the scheduler at import time (works with both gunicorn and direct run)
+# Delay first run by 10s so gunicorn worker can finish booting and accept requests
 scheduler = BackgroundScheduler()
-scheduler.add_job(refresh_default_cache, "interval", minutes=5, id="refresh_cache", next_run_time=datetime.now())
-scheduler.add_job(check_and_book, "interval", seconds=30, id="check_and_book")
+scheduler.add_job(refresh_default_cache, "interval", minutes=5, id="refresh_cache",
+                  next_run_time=datetime.now() + timedelta(seconds=10))
+scheduler.add_job(check_and_book, "interval", seconds=30, id="check_and_book",
+                  next_run_time=datetime.now() + timedelta(seconds=15))
 scheduler.start()
-print("Scheduler started — cache refresh every 5 min, watchlist check every 30 sec")
+print("Scheduler started — first cache refresh in 10s")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))

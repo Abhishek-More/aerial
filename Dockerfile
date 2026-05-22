@@ -22,4 +22,4 @@ COPY api/ ./api/
 
 WORKDIR /app/api
 
-CMD sh -c "gunicorn app:app --bind 0.0.0.0:${PORT:-5050} --workers 1 --threads 2 --preload --timeout 120"
+CMD sh -c "gunicorn app:app --bind 0.0.0.0:${PORT:-5050} --workers 1 --threads 2 --preload --timeout 120 --access-logfile -"
