@@ -254,8 +254,10 @@
           const spotsText = cls.has_signup ? `${cls.open} open` : 'Not yet open';
 
           let actionBtn = '';
-          if (cls.has_signup && cls.class_id) {
+          if (cls.has_signup && cls.class_id && cls.open > 0) {
             actionBtn = `<button class="btn-book btn-small" onclick="bookClass('${cls.class_id}','${cls.class_date}')">Book</button>`;
+          } else if (cls.has_signup && cls.class_id && cls.open === 0) {
+            actionBtn = `<button class="btn-small" disabled style="background:#333;color:#666;cursor:not-allowed;">Full</button>`;
           } else if (cls.watched) {
             actionBtn = `<button class="btn-unwatch btn-small" onclick="unwatchClass(${JSON.stringify(cls).replace(/"/g,'&quot;')})">Watching</button>`;
           } else {
