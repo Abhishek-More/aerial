@@ -1,7 +1,7 @@
 import re
 import os
 import json
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://clients.mindbodyonline.com"
@@ -15,7 +15,7 @@ HEADERS = {
 }
 
 
-def save_cookie_jar(session: cloudscraper.CloudScraper):
+def save_cookie_jar(session: requests.Session):
     """Save session cookies to disk for reuse."""
     cookies = {}
     for cookie in session.cookies:
@@ -28,7 +28,7 @@ def save_cookie_jar(session: cloudscraper.CloudScraper):
         json.dump(cookies, f)
 
 
-def load_cookie_jar(session: cloudscraper.CloudScraper) -> bool:
+def load_cookie_jar(session: requests.Session) -> bool:
     """Load previously saved cookies. Returns True if loaded."""
     if not os.path.exists(COOKIE_JAR_FILE):
         return False
@@ -39,73 +39,76 @@ def load_cookie_jar(session: cloudscraper.CloudScraper) -> bool:
     return bool(cookies)
 
 
-def login(session: cloudscraper.CloudScraper, email: str, password: str) -> bool:
+def login_with_playwright(email: str, password: str) -> dict[str, str]:
     """
-    Log in to MindBody via the identity flow.
-    Returns True on success.
+    Use a headless browser to log in and bypass Cloudflare.
+    Returns a dict of cookies to apply to a requests session.
     """
-    print("Logging in...")
+    from playwright.sync_api import sync_playwright
 
-    # Step 1: Hit the main page to get initial session cookies
-    resp = session.get(f"{BASE_URL}/classic/ws?studioid=836167", allow_redirects=True)
-    resp.raise_for_status()
+    print("Launching headless browser for login...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1280, "height": 720},
+        )
+        page = context.new_page()
 
-    # Step 2: Post credentials to the login endpoint
-    login_url = f"{BASE_URL}/ASP/login_p.asp"
-    login_data = {
-        "requiredtxtUserName": email,
-        "requiredtxtPassword": password,
-        "tg": "",
-        "vt": "",
-        "lvl": "",
-        "stype": "",
-        "qParam": "",
-        "view": "",
-        "trn": "0",
-        "page": "",
-        "catid": "",
-        "prodid": "",
-        "prodGroupId": "",
-        "date": "",
-        "classid": "0",
-        "sSU": "",
-        "optForwardingLink": "",
-        "isAsync": "false",
-    }
-    resp2 = session.post(login_url, data=login_data, allow_redirects=True)
-    resp2.raise_for_status()
+        # Step 1: Navigate to the studio page — Cloudflare challenge is solved by the real browser
+        page.goto(f"{BASE_URL}/classic/ws?studioid=836167", wait_until="networkidle", timeout=60000)
 
-    # Check if login succeeded by looking for "signed in" or the welcome message
-    if "you're signed in" in resp2.text.lower() or "you&#39;re signed in" in resp2.text.lower():
-        print("Login successful!")
-        save_cookie_jar(session)
-        return True
+        # Step 2: Fill in login form
+        # Wait for the login form to appear
+        page.wait_for_selector("#su1UserName", timeout=30000)
+        page.fill("#su1UserName", email)
+        page.fill("#su1Password", password)
 
-    # Sometimes MindBody uses identity/OAuth login instead of the classic form.
-    if "IdentityLogin" in resp2.url or "identity" in resp2.url.lower():
-        print("This studio uses Identity login (OAuth). Classic login not supported.")
-        return False
+        # Click the login button
+        page.click("#btnSu1Login")
 
-    # Check for login errors
-    soup = BeautifulSoup(resp2.text, "html.parser")
-    error_div = soup.find("div", id="LoginError") or soup.find("div", class_="LoginErrorDiv")
-    if error_div and error_div.get_text(strip=True):
-        print(f"Login failed: {error_div.get_text(strip=True)}")
-        return False
+        # Step 3: Wait for login to complete — look for "signed in" text
+        try:
+            page.wait_for_selector("#top-wel-sp", timeout=30000)
+            print("Browser login successful!")
+        except Exception:
+            # Check if we're on a different page that indicates success
+            if "signed in" in page.content().lower():
+                print("Browser login successful!")
+            else:
+                browser.close()
+                raise RuntimeError(f"Browser login failed. Page URL: {page.url}")
 
-    print("Login status unclear — checking if session is valid...")
-    return check_session(session)
+        # Step 4: Extract all cookies
+        browser_cookies = context.cookies()
+        browser.close()
+
+    # Convert to dict
+    cookies = {}
+    for c in browser_cookies:
+        cookies[c["name"]] = {
+            "value": c["value"],
+            "domain": c["domain"],
+            "path": c.get("path", "/"),
+        }
+    return cookies
 
 
-def check_session(session: cloudscraper.CloudScraper) -> bool:
+def apply_cookies(session: requests.Session, cookies: dict):
+    """Apply a cookie dict to a requests session."""
+    for name, info in cookies.items():
+        session.cookies.set(name, info["value"], domain=info["domain"], path=info["path"])
+
+
+def check_session(session: requests.Session) -> bool:
     """Check if the current session is still valid."""
-    resp = session.get(f"{BASE_URL}/classic/mainclass?fl=true&tabID=7", allow_redirects=False)
-    # If we get a 200 with actual class content, session is good
-    # If we get a redirect or a resetSession page, it's expired
-    if resp.status_code == 200 and "resetSession" not in resp.text and "classSchedule" in resp.text:
-        return True
+    try:
+        resp = session.get(f"{BASE_URL}/classic/mainclass?fl=true&tabID=7", allow_redirects=False, timeout=15)
+        if resp.status_code == 200 and "resetSession" not in resp.text and "classSchedule" in resp.text:
+            return True
+    except Exception:
+        pass
     return False
-
 
 
 def get_credentials() -> tuple[str, str]:
@@ -117,8 +120,8 @@ def get_credentials() -> tuple[str, str]:
     return email, password
 
 
-def get_session() -> cloudscraper.CloudScraper:
-    session = cloudscraper.create_scraper()
+def get_session() -> requests.Session:
+    session = requests.Session()
     session.headers.update(HEADERS)
 
     # Try 1: Load saved cookie jar from last successful session
@@ -126,17 +129,27 @@ def get_session() -> cloudscraper.CloudScraper:
         print("Restored session from saved cookies.")
         return session
 
-    # Try 2: Log in with credentials
+    # Try 2: Log in with playwright (bypasses Cloudflare)
     session.cookies.clear()
     email, password = get_credentials()
-    if login(session, email, password):
+    cookies = login_with_playwright(email, password)
+
+    # Apply cookies to requests session
+    apply_cookies(session, cookies)
+
+    # Save for next time
+    with open(COOKIE_JAR_FILE, "w") as f:
+        json.dump(cookies, f)
+
+    if check_session(session):
+        print("Session established via browser login.")
         return session
 
-    raise RuntimeError("Login failed. Check your credentials and try again.")
+    raise RuntimeError("Login succeeded in browser but session check failed.")
 
 
 def get_classes(
-    session: cloudscraper.CloudScraper,
+    session: requests.Session,
     date: str = "",
     location: str = "1",
     tab_id: str = "7",
@@ -167,7 +180,7 @@ def get_classes(
         "optInstructor": "0",
     }
 
-    resp = session.post(url, params=params, data=form_data)
+    resp = session.post(url, params=params, data=form_data, timeout=30)
     resp.raise_for_status()
     return parse_classes(resp.text)
 
@@ -298,7 +311,7 @@ def parse_classes(html: str) -> list[dict]:
     return future_classes
 
 
-def signup_for_class(session: cloudscraper.CloudScraper, class_id: str, class_date: str, tg: str = "28", cls_loc: str = "1") -> str:
+def signup_for_class(session: requests.Session, class_id: str, class_date: str, tg: str = "28", cls_loc: str = "1") -> str:
     """
     Book a class through the 3-step MindBody flow:
       1. res_a.asp    — reservation page (sets session state)
@@ -308,7 +321,7 @@ def signup_for_class(session: cloudscraper.CloudScraper, class_id: str, class_da
     # Step 1: Hit the reservation page
     res_a_url = f"{BASE_URL}/ASP/res_a.asp"
     res_a_params = {"tg": tg, "classId": class_id, "classDate": class_date, "clsLoc": cls_loc}
-    resp = session.get(res_a_url, params=res_a_params)
+    resp = session.get(res_a_url, params=res_a_params, timeout=30)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -319,7 +332,6 @@ def signup_for_class(session: cloudscraper.CloudScraper, class_id: str, class_da
         return f"Class {class_id} on {class_date} is FULL."
 
     # Step 2: Hit res_deb.asp to confirm the booking
-    # Extract clientId from the page if available, fallback to finding it in scripts
     client_id = ""
     client_match = re.search(r"clientId=(\d+)", resp.text)
     if client_match:
@@ -339,13 +351,13 @@ def signup_for_class(session: cloudscraper.CloudScraper, class_id: str, class_da
         "clientId": client_id,
         "enroll": "false",
     }
-    resp2 = session.get(res_deb_url, params=res_deb_params)
+    resp2 = session.get(res_deb_url, params=res_deb_params, timeout=30)
     resp2.raise_for_status()
 
     soup2 = BeautifulSoup(resp2.text, "html.parser")
     page_text2 = soup2.get_text()
 
-    # Step 3: Check for confirmation — look for the classSchIDs redirect or confirmation text
+    # Step 3: Check for confirmation
     if "you've booked" in page_text2.lower() or "notifyBooking" in resp2.text:
         return f"Successfully booked class {class_id} on {class_date}!"
 
@@ -363,19 +375,17 @@ def signup_for_class(session: cloudscraper.CloudScraper, class_id: str, class_da
             "modal": "",
             "tabID": "2",
         }
-        resp3 = session.get(my_sch_url, params=my_sch_params)
+        resp3 = session.get(my_sch_url, params=my_sch_params, timeout=30)
         resp3.raise_for_status()
         soup3 = BeautifulSoup(resp3.text, "html.parser")
         page_text3 = soup3.get_text()
 
         if "you've booked" in page_text3.lower():
-            # Extract what was booked
             notify = soup3.find("div", id="notifyBooking")
             if notify:
                 return notify.get_text(strip=True)
             return f"Successfully booked class {class_id} on {class_date}!"
 
-    # If we got here, check for errors
     if "full" in page_text2.lower() or "waitlist" in page_text2.lower():
         return f"Class {class_id} on {class_date} is FULL."
 

@@ -3,3 +3,5 @@ gunicorn
 apscheduler
 cloudscraper
 beautifulsoup4
+playwright
+requests
