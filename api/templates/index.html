@@ -155,6 +155,12 @@
             <button class="btn-nav" onclick="changeWeek(-1)">&larr;</button>
             <button class="btn-nav" onclick="goToday()">Today</button>
             <button class="btn-nav" onclick="changeWeek(1)">&rarr;</button>
+            <div style="position:relative;display:inline-block;">
+              <button class="btn-nav" onclick="document.getElementById('datePicker').showPicker()" title="Pick a date">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+              </button>
+              <input type="date" id="datePicker" style="position:absolute;top:0;left:0;width:0;height:0;opacity:0;pointer-events:none;" onchange="pickDate(this.value)">
+            </div>
           </div>
           <span class="status" id="classStatus"></span>
           <button class="btn-refresh" id="refreshBtn" onclick="forceRefresh()" title="Force refresh from MindBody">
@@ -207,6 +213,13 @@
 
       function goToday() {
         currentDate = new Date();
+        fetchClasses();
+      }
+
+      function pickDate(val) {
+        if (!val) return;
+        const [y, m, d] = val.split('-').map(Number);
+        currentDate = new Date(y, m - 1, d);
         fetchClasses();
       }
 
