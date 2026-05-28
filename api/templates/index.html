@@ -101,6 +101,13 @@
       @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
       .loading { text-align: center; padding: 40px; color: #666; }
+      .boot-log {
+        text-align: left; padding: 20px 24px; color: #555; font-family: 'SF Mono', 'Fira Code', monospace;
+        font-size: 0.75rem; line-height: 1.7; max-height: 300px; overflow-y: auto;
+      }
+      .boot-log .log-line { color: #6366f1; opacity: 0; animation: fadeIn 0.2s forwards; }
+      .boot-log .log-line:last-child { color: #a5b4fc; }
+      @keyframes fadeIn { to { opacity: 1; } }
       .empty { text-align: center; padding: 30px; color: #555; font-size: 0.9rem; }
 
       .toast {
@@ -194,7 +201,7 @@
       }
 
       function changeWeek(dir) {
-        currentDate.setDate(currentDate.getDate() + dir * 7);
+        currentDate.setDate(currentDate.getDate() + dir);
         fetchClasses();
       }
 
@@ -421,9 +428,32 @@
         } catch (e) { showToast('Error: ' + e.message); }
       }
 
-      // --- Init ---
-      fetchClasses();
-      fetchWatchlist();
+      // --- Init: stream boot logs, then fetch classes ---
+      (function boot() {
+        const el = document.getElementById('classList');
+        el.innerHTML = '<div class="boot-log" id="bootLog"></div>';
+        const logEl = document.getElementById('bootLog');
+
+        const es = new EventSource('/api/boot-log');
+        es.onmessage = function(e) {
+          if (e.data === '__DONE__') {
+            es.close();
+            fetchClasses();
+            fetchWatchlist();
+            return;
+          }
+          const line = document.createElement('div');
+          line.className = 'log-line';
+          line.textContent = e.data;
+          logEl.appendChild(line);
+          logEl.scrollTop = logEl.scrollHeight;
+        };
+        es.onerror = function() {
+          es.close();
+          fetchClasses();
+          fetchWatchlist();
+        };
+      })();
     </script>
   </body>
 </html>

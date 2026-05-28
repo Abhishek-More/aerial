@@ -4,7 +4,9 @@ import json
 import requests
 import urllib3
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
+load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://clients.mindbodyonline.com"

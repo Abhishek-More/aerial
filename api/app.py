@@ -1,17 +1,41 @@
 import json
 import os
 import re
+import sys
 import threading
 import time as _time
+from collections import deque
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 
 from bot import get_classes, get_session, signup_for_class, login_with_playwright, get_credentials, apply_cookies, save_cookie_jar, check_session, HEADERS, COOKIE_JAR_FILE
 
 app = Flask(__name__)
+
+# --- Boot log capture ---
+_boot_log = deque(maxlen=200)
+_boot_done = threading.Event()
+_original_stdout = sys.stdout
+
+
+class _BootLogCapture:
+    """Tee stdout to both the terminal and the boot log buffer."""
+    def __init__(self, original):
+        self._original = original
+
+    def write(self, msg):
+        self._original.write(msg)
+        if msg.strip():
+            _boot_log.append(msg.strip())
+
+    def flush(self):
+        self._original.flush()
+
+
+sys.stdout = _BootLogCapture(_original_stdout)
 
 DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
 WATCHLIST_FILE = os.path.join(DATA_DIR, "watchlist.json")
@@ -34,12 +58,28 @@ CACHE_TTL = 300  # 5 minutes
 
 def get_bot_session():
     global _session
+    _boot_done.wait()  # block until startup init finishes
     with _session_lock:
         if _session is None:
-            print("[app] Initializing bot session (first time)...")
+            print("[app] Initializing bot session...")
             _session = get_session()
             print("[app] Bot session ready.")
         return _session
+
+
+def _init_session_background():
+    """Run session init eagerly on startup so boot logs stream in real time."""
+    global _session
+    try:
+        with _session_lock:
+            print("[app] Initializing bot session...")
+            _session = get_session()
+            print("[app] Bot session ready.")
+    except Exception as e:
+        print(f"[app] Session init failed: {e}")
+    finally:
+        _boot_done.set()
+        sys.stdout = _original_stdout
 
 
 def force_reauth():
@@ -306,6 +346,27 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/api/boot-log")
+def api_boot_log():
+    """SSE stream of boot/login progress messages."""
+    def stream():
+        sent = 0
+        while not _boot_done.is_set():
+            logs = list(_boot_log)
+            for msg in logs[sent:]:
+                yield f"data: {msg}\n\n"
+            sent = len(logs)
+            _time.sleep(0.3)
+        # flush remaining
+        logs = list(_boot_log)
+        for msg in logs[sent:]:
+            yield f"data: {msg}\n\n"
+        yield "data: __DONE__\n\n"
+
+    return Response(stream(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.route("/api/classes")
 def api_classes():
     """Fetch all classes for the given week (served from cache)."""
@@ -496,6 +557,9 @@ def api_upload_cookies():
 
     return jsonify({"status": "ok", "cookies": len(data), "has_idsrvauth": has_auth})
 
+
+# --- Eager session init ---
+threading.Thread(target=_init_session_background, daemon=True).start()
 
 # --- Scheduler startup ---
 scheduler = BackgroundScheduler()
