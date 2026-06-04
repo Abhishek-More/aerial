@@ -5,3 +5,4 @@ cloudscraper
 beautifulsoup4
 playwright
 requests
+python-dotenv

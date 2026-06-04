@@ -102,15 +102,24 @@ def login_with_playwright(email: str, password: str) -> dict[str, str]:
         print("[login] Clicking login button...")
         page.click("#btnSu1Login")
 
-        # Give login time to process — wait a bit then grab cookies
-        print("[login] Waiting for login to process...")
-        page.wait_for_timeout(5000)
+        # Login is async (reCAPTCHA validation -> POST -> redirect -> auth cookie set).
+        # A fixed sleep was racy: it often grabbed cookies while still on su1.asp,
+        # before idsrvauth existed. Poll until the auth cookie actually appears.
+        print("[login] Waiting for login to process (idsrvauth cookie)...")
+        got_auth = False
+        for _ in range(30):  # up to ~30s
+            page.wait_for_timeout(1000)
+            if any(c["name"] == "idsrvauth" for c in context.cookies()):
+                got_auth = True
+                break
         try:
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
             pass
 
-        print(f"[login] Post-login URL: {page.url}")
+        if not got_auth:
+            print("[login] WARNING: idsrvauth cookie never appeared — login may have failed.")
+        print(f"[login] Post-login URL: {page.url} (idsrvauth seen: {got_auth})")
 
         # Grab cookies immediately — no further navigation needed
         browser_cookies = context.cookies()
@@ -155,10 +164,40 @@ def check_session(session: requests.Session) -> bool:
     return False
 
 
+def get_user_name(session: requests.Session) -> str | None:
+    """Return the signed-in member's display name, or None if not logged in.
+
+    Parses the "Welcome <bold>Name</bold>" greeting on the member info page.
+    """
+    try:
+        resp = session.get(f"{BASE_URL}/ASP/main_info.asp?studioid=836167", timeout=15)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        span = soup.find("span", id="top-wel-sp")
+        if span:
+            bold = span.find("span", class_="bold")
+            if bold:
+                name = bold.get_text(" ", strip=True).replace("\xa0", " ")
+                name = " ".join(name.split())
+                if name:
+                    return name
+    except Exception as e:
+        print(f"[user] Name lookup failed: {e}")
+    return None
+
+
+def _envq(key: str, default: str = "") -> str:
+    """Read an env var, stripping one layer of surrounding quotes (Docker's
+    --env-file keeps quotes literal, e.g. MB_PASSWORD='"abc"')."""
+    v = os.environ.get(key, default)
+    if v and len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1]
+    return v
+
+
 def get_credentials() -> tuple[str, str]:
     """Load credentials from environment variables."""
-    email = os.environ.get("MB_EMAIL", "")
-    password = os.environ.get("MB_PASSWORD", "")
+    email = _envq("MB_EMAIL")
+    password = _envq("MB_PASSWORD")
     if not email or not password:
         raise RuntimeError("Set MB_EMAIL and MB_PASSWORD environment variables.")
     return email, password

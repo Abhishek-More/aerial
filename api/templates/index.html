@@ -88,6 +88,7 @@
         align-items: center; padding: 12px 8px; border-bottom: 1px solid #1a1a2e;
         gap: 8px;
       }
+      .wl-mobile-meta { display: none; }
       .wl-status { padding: 3px 10px; border-radius: 12px; font-size: 0.72rem; font-weight: 600; display: inline-block; }
       .status-waiting { background: #1e1b4b; color: #a5b4fc; }
       .status-booked { background: #052e16; color: #4ade80; }
@@ -136,13 +137,19 @@
 
         .watchlist-item { grid-template-columns: 1fr auto; gap: 4px; }
         .wl-date, .wl-time, .wl-header-date, .wl-header-time { display: none; }
+        .wl-mobile-meta { display: block; color: #888; font-size: 0.72rem; margin-top: 3px; }
 
       }
     </style>
   </head>
   <body>
     <div class="container">
-      <h1>Aerial</h1>
+      <h1>Aerial
+        <span id="authIcon" title="checking session..." style="vertical-align:middle;margin-left:8px;"></span>
+        <span id="authUser" style="font-size:13px;font-weight:normal;color:#888;margin-left:6px;vertical-align:middle;"></span>
+        <button class="btn-nav" id="reauthBtn" onclick="requestReauth()" title="Refresh login session"
+                style="float:right;font-size:12px;">Re-auth</button>
+      </h1>
 
       <div class="tabs">
         <div class="tab active" data-tab="classes">Classes</div>
@@ -155,11 +162,12 @@
             <button class="btn-nav" onclick="changeWeek(-1)">&larr;</button>
             <button class="btn-nav" onclick="goToday()">Today</button>
             <button class="btn-nav" onclick="changeWeek(1)">&rarr;</button>
-            <div style="position:relative;display:inline-block;">
-              <button class="btn-nav" onclick="document.getElementById('datePicker').showPicker()" title="Pick a date">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-              </button>
-              <input type="date" id="datePicker" style="position:absolute;top:0;left:0;width:0;height:0;opacity:0;pointer-events:none;" onchange="pickDate(this.value)">
+            <div class="btn-nav" style="position:relative;display:inline-flex;align-items:center;justify-content:center;padding:6px 12px;border-radius:6px;box-sizing:border-box;" title="Pick a date">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none;"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+              <!-- Real date input overlaid invisibly so a tap opens the native picker directly (works on mobile; no showPicker needed) -->
+              <input type="date" id="datePicker" aria-label="Pick a date" onchange="pickDate(this.value)"
+                     onclick="try{ this.showPicker && this.showPicker(); }catch(e){}"
+                     style="position:absolute;inset:0;width:100%;height:100%;opacity:0;border:0;margin:0;padding:0;cursor:pointer;-webkit-appearance:none;appearance:none;">
             </div>
           </div>
           <span class="status" id="classStatus"></span>
@@ -241,6 +249,35 @@
         }
       }
 
+      const LOCK_CLOSED = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+      const LOCK_OPEN = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>';
+
+      async function refreshAuthDot() {
+        const icon = document.getElementById('authIcon');
+        try {
+          const r = await fetch('/api/auth-status');
+          const d = await r.json();
+          icon.innerHTML = d.authenticated ? LOCK_CLOSED : LOCK_OPEN;
+          icon.title = d.authenticated ? 'Authenticated (idsrvauth present)' : 'Not authenticated — tap Re-auth';
+          document.getElementById('authUser').textContent = (d.authenticated && d.user) ? d.user : '';
+        } catch (e) {
+          icon.title = 'Auth status unknown';
+        }
+      }
+
+      async function requestReauth() {
+        const btn = document.getElementById('reauthBtn');
+        btn.disabled = true;
+        try {
+          await fetch('/api/request-reauth', { method: 'POST' });
+          showToast('Re-auth requested — reload in a moment to see status.');
+        } catch (e) {
+          showToast('Failed to request re-auth');
+        } finally {
+          setTimeout(() => { btn.disabled = false; }, 3000);
+        }
+      }
+
       async function forceRefresh() {
         const btn = document.getElementById('refreshBtn');
         btn.classList.add('spinning');
@@ -274,17 +311,19 @@
           const spotsClass = isPast ? 'unknown' : cls.open > 0 ? 'open' : cls.has_signup ? 'full' : 'unknown';
           const spotsText = isPast ? '' : cls.has_signup ? `${cls.open} open` : 'Not yet open';
 
+          const clsJson = JSON.stringify(cls).replace(/"/g,'&quot;');
           let actionBtn = '';
           if (isPast) {
             actionBtn = '';
+          } else if (cls.watched) {
+            actionBtn = `<button class="btn-unwatch btn-small" onclick="unwatchClass(${clsJson})">Watching</button>`;
           } else if (cls.has_signup && cls.class_id && cls.open > 0) {
             actionBtn = `<button class="btn-book btn-small" onclick="bookClass('${cls.class_id}','${cls.class_date}')">Book</button>`;
           } else if (cls.has_signup && cls.class_id && cls.open === 0) {
-            actionBtn = `<button class="btn-small" disabled style="background:#333;color:#666;cursor:not-allowed;">Full</button>`;
-          } else if (cls.watched) {
-            actionBtn = `<button class="btn-unwatch btn-small" onclick="unwatchClass(${JSON.stringify(cls).replace(/"/g,'&quot;')})">Watching</button>`;
+            // Full — offer to watch for an opening and email when a spot frees up.
+            actionBtn = `<button class="btn-watch btn-small" onclick="watchClass(${clsJson}, 'notify')">Notify</button>`;
           } else {
-            actionBtn = `<button class="btn-watch btn-small" onclick="watchClass(${JSON.stringify(cls).replace(/"/g,'&quot;')})">Watch</button>`;
+            actionBtn = `<button class="btn-watch btn-small" onclick="watchClass(${clsJson})">Watch</button>`;
           }
 
           const rowStyle = isPast ? 'opacity:0.35;' : '';
@@ -318,14 +357,17 @@
         } catch (e) { showToast('Error: ' + e.message); }
       }
 
-      async function watchClass(cls) {
+      async function watchClass(cls, mode) {
         try {
+          const body = Object.assign({}, cls, { mode: mode || 'autobook' });
           const res = await fetch('/api/watch', {
             method: 'POST', headers: {'Content-Type':'application/json'},
-            body: JSON.stringify(cls),
+            body: JSON.stringify(body),
           });
           const data = await res.json();
-          showToast(data.status === 'already_watched' ? 'Already watching' : 'Added to watchlist');
+          const msg = data.status === 'already_watched' ? 'Already watching'
+            : (mode === 'notify' ? "Watching — auto-books if a spot opens 24h+ out, emails you either way" : 'Added to watchlist');
+          showToast(msg);
           fetchClasses(); fetchWatchlist();
         } catch (e) { showToast('Error: ' + e.message); }
       }
@@ -408,8 +450,29 @@
             dotClass = 'dot-reauth'; phaseLabel = 'Re-auth'; statusClass = 'status-reauth';
           }
 
+          // Notify-mode watches (full classes) show a status instead of a countdown.
+          if (w.mode === 'notify') {
+            if (w.status === 'booked') {
+              dotClass = 'dot-done'; phaseLabel = 'Booked';
+            } else if (w.status === 'book_failed') {
+              dotClass = 'dot-reauth'; phaseLabel = 'Book failed';
+            } else if (w.status === 'opened') {
+              dotClass = 'dot-done'; phaseLabel = 'Opened';
+            } else if (w.status === 'expired') {
+              dotClass = 'dot-reauth'; phaseLabel = 'Expired';
+            } else {
+              dotClass = 'dot-scheduled'; phaseLabel = 'Watching';
+            }
+          }
+
           let opensHtml = '?';
-          if (w.open_time) {
+          if (w.mode === 'notify') {
+            if (w.status === 'booked') opensHtml = 'Booked ✓';
+            else if (w.status === 'book_failed') opensHtml = 'Book failed';
+            else if (w.status === 'opened') opensHtml = `Open — ${w.emailed ? 'emailed' : 'email failed'}`;
+            else if (w.status === 'expired') opensHtml = 'Class passed';
+            else opensHtml = 'Watching for opening';
+          } else if (w.open_time) {
             const diff = (new Date(w.open_time) - new Date()) / 1000;
             opensHtml = `<span data-open-time="${w.open_time}">${formatCountdown(diff)}</span>`;
           }
@@ -422,6 +485,7 @@
               <div>
                 <strong>${w.class_name}</strong><br>
                 <span style="color:#888;font-size:0.75rem;">${w.teacher||''} · ${w.time || ''}</span>
+                <span class="wl-mobile-meta"><span class="phase-dot ${dotClass}"></span>${w.date_label || w.class_date || ''} · ${w.mode === 'notify' ? opensHtml : 'opens ' + opensHtml}</span>
               </div>
               <div class="wl-date">${w.date_label || w.class_date || ''}</div>
               <div class="wl-time"><span class="phase-dot ${dotClass}"></span>${opensHtml}</div>
@@ -443,6 +507,7 @@
 
       // --- Init: stream boot logs, then fetch classes ---
       (function boot() {
+        refreshAuthDot();
         const el = document.getElementById('classList');
         el.innerHTML = '<div class="boot-log" id="bootLog"></div>';
         const logEl = document.getElementById('bootLog');

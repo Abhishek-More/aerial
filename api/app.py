@@ -1,17 +1,20 @@
 import json
 import os
+import random
 import re
+import smtplib
 import sys
 import threading
 import time as _time
 from collections import deque
 from datetime import datetime, timedelta
+from email.message import EmailMessage
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from flask import Flask, Response, jsonify, render_template, request
 
-from bot import get_classes, get_session, signup_for_class, login_with_playwright, get_credentials, apply_cookies, save_cookie_jar, check_session, HEADERS, COOKIE_JAR_FILE
+from bot import get_classes, get_session, signup_for_class, login_with_playwright, get_credentials, apply_cookies, save_cookie_jar, check_session, get_user_name, HEADERS, COOKIE_JAR_FILE, BASE_URL
 
 app = Flask(__name__)
 
@@ -45,6 +48,23 @@ LOG_FILE = os.path.join(DATA_DIR, "booking_log.json")
 SIGNUP_OFFSET = timedelta(weeks=1, minutes=15)
 # Re-auth 5 minutes before signup opens
 REAUTH_BEFORE = timedelta(minutes=5)
+
+# "Notify when a full class opens up" — re-check on a randomized interval
+FULL_CHECK_MIN = 300  # 5 min
+FULL_CHECK_MAX = 600  # 10 min
+# Auto-book a freed-up watched class only if it starts at least this far out.
+BOOK_LEAD_TIME = timedelta(hours=24)
+
+# Lightweight activity counters, summarized hourly (see hourly_recap)
+_stats_lock = threading.Lock()
+STATS = {"checks": 0, "cache_refreshes": 0, "opens": 0, "booked": 0, "book_failed": 0,
+         "emails_sent": 0, "emails_failed": 0, "reauths": 0, "cookie_uploads": 0,
+         "auth_checks": 0, "auth_heals": 0}
+
+
+def bump(key, n=1):
+    with _stats_lock:
+        STATS[key] = STATS.get(key, 0) + n
 
 # Global session
 _session = None
@@ -82,10 +102,45 @@ def _init_session_background():
         sys.stdout = _original_stdout
 
 
+def _is_authed() -> bool:
+    """True if the current session carries an auth cookie."""
+    return bool(_session) and any(c.name == "idsrvauth" for c in _session.cookies)
+
+
+def _write_reauth_flag():
+    """Drop the flag the host watcher reacts to (runs the headed login helper)."""
+    flag = os.path.join(DATA_DIR, ".reauth_request")
+    with open(flag, "w") as f:
+        f.write(datetime.now().isoformat())
+
+
+def trigger_host_reauth(timeout: int = 90) -> bool:
+    """Ask the host to run its reliable headed-Chrome login (same as ./refresh-login),
+    then wait for it to push fresh cookies back via /api/upload-cookies.
+
+    This is preferred over headless force_reauth, which reCAPTCHA usually blocks.
+    Returns True if a fresh cookie upload arrived within `timeout` seconds."""
+    with _stats_lock:
+        before_uploads = STATS.get("cookie_uploads", 0)
+    bump("reauths")
+    _write_reauth_flag()
+    print(f"[reauth] Requested host headed-login; waiting up to {timeout}s for fresh cookies...")
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        with _stats_lock:
+            if STATS.get("cookie_uploads", 0) > before_uploads:
+                print("[reauth] Fresh cookies received from host login.")
+                return True
+        _time.sleep(2)
+    print("[reauth] Host reauth did not complete in time (is the Mac logged in / profile warmed?).")
+    return False
+
+
 def force_reauth():
-    """Force a fresh login to get new cookies."""
+    """Headless re-auth fallback (often blocked by reCAPTCHA). Prefer trigger_host_reauth."""
     global _session
-    print("[reauth] Forcing re-authentication...")
+    bump("reauths")
+    print("[reauth] Forcing re-authentication (headless fallback)...")
     with _session_lock:
         import requests as req
         _session = req.Session()
@@ -101,6 +156,38 @@ def force_reauth():
         print(f"[reauth] Done. Has idsrvauth: {has_auth}")
 
 
+def boot_auth_heal():
+    """Shortly after startup, if we're not authenticated (e.g. cookie jar expired
+    and the headless login was blocked), pull a fresh session from the host login."""
+    _boot_done.wait()
+    if not _is_authed():
+        print("[reauth] Not authenticated after boot — requesting host reauth.")
+        trigger_host_reauth(timeout=120)
+
+
+def _session_valid() -> bool:
+    """Quiet validity probe: do we have an idsrvauth cookie AND a working session?"""
+    if not _is_authed():
+        return False
+    try:
+        r = _session.get(f"{BASE_URL}/classic/mainclass?fl=true&tabID=7",
+                         allow_redirects=False, timeout=15)
+        return r.status_code == 200 and "resetSession" not in r.text and "classSchedule" in r.text
+    except Exception:
+        return False
+
+
+def hourly_auth_check():
+    """Once an hour, confirm the session is genuinely authenticated; if not, pull a
+    fresh login from the host. Quiet on success to keep the log clean."""
+    bump("auth_checks")
+    if _session_valid():
+        return
+    print("[auth-check] Session not valid (missing/expired idsrvauth) — requesting host reauth.")
+    bump("auth_heals")
+    trigger_host_reauth(timeout=120)
+
+
 def get_cached_classes(date="", location="0", category="0", force=False):
     """Return classes from cache if fresh, otherwise fetch and cache."""
     cache_key = (date, location, category)
@@ -111,10 +198,8 @@ def get_cached_classes(date="", location="0", category="0", force=False):
         if cached and not force and (now - cached["fetched_at"]) < CACHE_TTL:
             return cached["classes"]
 
-    print(f"[cache] MISS for {cache_key}, force={force}. Fetching...")
     session = get_bot_session()
     classes = get_classes(session, date=date, location=location, class_type=category)
-    print(f"[cache] Fetched {len(classes)} classes")
 
     with _cache_lock:
         _class_cache[cache_key] = {"classes": classes, "fetched_at": _time.time()}
@@ -125,8 +210,8 @@ def get_cached_classes(date="", location="0", category="0", force=False):
 def refresh_default_cache():
     """Background job: keep the default view warm."""
     try:
-        classes = get_cached_classes(date="", location="0", category="0", force=True)
-        print(f"[scheduler] Cache refreshed: {len(classes)} classes")
+        get_cached_classes(date="", location="0", category="0", force=True)
+        bump("cache_refreshes")
     except Exception as e:
         print(f"[scheduler] Cache refresh error: {type(e).__name__}: {e}")
 
@@ -215,7 +300,7 @@ def schedule_snag(watch: dict):
         except Exception:
             pass
         scheduler.add_job(
-            force_reauth,
+            trigger_host_reauth,
             trigger=DateTrigger(run_date=reauth_time),
             id=reauth_job_id,
             replace_existing=True,
@@ -289,6 +374,7 @@ def rapid_book(watch: dict):
 
                     result = signup_for_class(session, cls["class_id"], cls["class_date"])
                     print(f"[rapid_book] RESULT: {result}")
+                    success = "successfully booked" in result.lower()
 
                     # Update watchlist
                     watchlist = load_watchlist()
@@ -296,12 +382,19 @@ def rapid_book(watch: dict):
                         if (w["class_name"] == class_name
                                 and w.get("class_date") == class_date
                                 and w.get("time") == time_str):
-                            w["status"] = "booked"
+                            w["status"] = "booked" if success else "book_failed"
                             w["result"] = result
                             w["booked_at"] = now.isoformat()
                             w["class_id"] = cls["class_id"]
                             break
                     save_watchlist(watchlist)
+
+                    emailed = send_booking_email(
+                        {"class_name": class_name, "class_date": class_date,
+                         "time": time_str, "teacher": watch.get("teacher", "")},
+                        result, success, source="auto-book at signup-open")
+                    bump("booked" if success else "book_failed")
+                    bump("emails_sent" if emailed else "emails_failed")
 
                     append_log({
                         "time": now.isoformat(),
@@ -337,6 +430,223 @@ def schedule_all_watches():
     for watch in watchlist:
         if watch.get("status") == "waiting":
             schedule_snag(watch)
+
+
+def hourly_recap():
+    """Print a once-an-hour summary of activity, then reset the counters."""
+    with _stats_lock:
+        s = dict(STATS)
+        for k in STATS:
+            STATS[k] = 0
+    try:
+        watchlist = load_watchlist()
+        notify_active = sum(1 for w in watchlist if w.get("mode") == "notify" and w.get("status") == "watching")
+        autobook_active = sum(1 for w in watchlist if w.get("mode") != "notify" and w.get("status") == "waiting")
+    except Exception:
+        notify_active = autobook_active = "?"
+    print(
+        f"[recap] Past hour — full-checks:{s['checks']} cache-refreshes:{s['cache_refreshes']} "
+        f"spots-opened:{s['opens']} booked:{s['booked']}(failed {s['book_failed']}) "
+        f"emails:{s['emails_sent']}(failed {s['emails_failed']}) "
+        f"reauths:{s['reauths']} cookie-uploads:{s['cookie_uploads']} "
+        f"auth-checks:{s['auth_checks']}(healed {s['auth_heals']}) | "
+        f"active watches — notify:{notify_active} autobook:{autobook_active}"
+    )
+
+
+# --- "Notify when a full class opens up" ---
+
+def _envq(key, default=""):
+    """Read an env var, stripping one layer of surrounding quotes.
+    Docker's --env-file keeps quotes literal (e.g. SMTP_PASS='"abc"'), so we
+    normalize here to be resilient to however .env is quoted."""
+    v = os.environ.get(key, default)
+    if v and len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1]
+    return v
+
+
+def _send_email(subject: str, body: str) -> bool:
+    """Send an email via SMTP to all configured recipients (NOTIFY_EMAIL may be a
+    comma-separated list; falls back to MB_EMAIL, then the sender). True on success."""
+    smtp_user = _envq("SMTP_USER")
+    smtp_pass = _envq("SMTP_PASS")
+    smtp_host = _envq("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(_envq("SMTP_PORT", "587"))
+    raw = _envq("NOTIFY_EMAIL") or _envq("MB_EMAIL") or smtp_user
+    recipients = [a.strip() for a in raw.split(",") if a.strip()]
+
+    if not smtp_user or not smtp_pass:
+        print("[email] SMTP_USER/SMTP_PASS not set — cannot send email.")
+        return False
+    if not recipients:
+        print("[email] No recipient address available.")
+        return False
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = smtp_user
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
+            s.starttls()
+            s.login(smtp_user, smtp_pass)
+            s.send_message(msg)
+        print(f"[email] Sent '{subject}' to {', '.join(recipients)}")
+        return True
+    except Exception as e:
+        print(f"[email] Failed to send: {e}")
+        return False
+
+
+def _class_when(info: dict) -> str:
+    return f"{info.get('date_label') or info.get('class_date', '')} at {info.get('time', '')}"
+
+
+def send_open_email(watch: dict, open_spots: int) -> bool:
+    """A watched class freed up but starts within 24h, so it was NOT auto-booked."""
+    cls = watch.get("class_name", "class")
+    return _send_email(
+        f"Spot open (not booked — within 24h): {cls} — {_class_when(watch)}",
+        f"A spot just opened in a class you're watching, but it starts in under 24 hours, "
+        f"so it was NOT auto-booked.\n\n"
+        f"Class:   {cls}\n"
+        f"When:    {_class_when(watch)}\n"
+        f"Teacher: {watch.get('teacher', '')}\n"
+        f"Open spots: {open_spots}\n\n"
+        f"Book it yourself: https://clients.mindbodyonline.com/classic/mainclass\n"
+    )
+
+
+def send_booking_email(info: dict, result: str, success: bool, source: str) -> bool:
+    """Email a confirmation (or failure notice) for any booking the app makes."""
+    cls = info.get("class_name") or info.get("name", "class")
+    status = "Booked" if success else "Booking FAILED"
+    return _send_email(
+        f"{status}: {cls} — {_class_when(info)}",
+        f"{'A class was booked' if success else 'A booking attempt failed'} ({source}).\n\n"
+        f"Class:   {cls}\n"
+        f"When:    {_class_when(info)}\n"
+        f"Teacher: {info.get('teacher', '')}\n"
+        f"Result:  {result}\n"
+    )
+
+
+def _find_cached_class(class_id: str, class_date: str) -> dict | None:
+    """Look up class details (name/time/teacher) from the cache by id + date."""
+    with _cache_lock:
+        for entry in _class_cache.values():
+            for c in entry.get("classes", []):
+                if str(c.get("class_id")) == str(class_id) and c.get("class_date") == class_date:
+                    return c
+    return None
+
+
+def schedule_next_full_check(delay: int | None = None):
+    """(Re)schedule the full-class checker at a randomized 5-10 min interval."""
+    if delay is None:
+        delay = random.randint(FULL_CHECK_MIN, FULL_CHECK_MAX)
+    run_at = datetime.now() + timedelta(seconds=delay)
+    try:
+        scheduler.add_job(
+            check_full_watches,
+            trigger=DateTrigger(run_date=run_at),
+            id="full_watch_check",
+            replace_existing=True,
+        )
+        pass  # next check scheduled (silent to reduce log noise)
+    except Exception as e:
+        print(f"[full_watch] Reschedule failed: {e}")
+
+
+def check_full_watches():
+    """Re-check every 'notify' watch: if a spot opened, email the user (no booking).
+    Self-reschedules with a fresh random delay each run."""
+    bump("checks")
+    try:
+        watchlist = load_watchlist()
+        pending = [w for w in watchlist if w.get("mode") == "notify" and w.get("status") == "watching"]
+        if not pending:
+            return
+
+        now = datetime.now()
+        by_date = {}
+        for w in pending:
+            by_date.setdefault(w.get("class_date", ""), []).append(w)
+
+        session = get_bot_session()
+        changed = False
+        for date, watches in by_date.items():
+            try:
+                classes = get_classes(session, date=date, location="0", class_type="0")
+            except Exception as e:
+                print(f"[full_watch] Fetch error for {date}: {e}")
+                continue
+            for w in watches:
+                class_dt = parse_class_datetime(w.get("class_date", ""), w.get("time", ""))
+                if class_dt and class_dt < now:
+                    w["status"] = "expired"
+                    changed = True
+                    print(f"[full_watch] {w['class_name']} on {date} expired (class passed).")
+                    continue
+                match = next(
+                    (c for c in classes
+                     if c["name"] == w["class_name"]
+                     and c["class_date"] == w.get("class_date")
+                     and c["time"] == w.get("time")),
+                    None,
+                )
+                if not match:
+                    continue
+                if match.get("has_signup") and match.get("open", 0) > 0:
+                    bump("opens")
+                    class_id = match.get("class_id") or w.get("class_id")
+                    w["open_spots"] = match["open"]
+                    w["class_id"] = class_id
+                    changed = True
+
+                    far_enough = class_dt is not None and (class_dt - now) >= BOOK_LEAD_TIME
+                    if far_enough and class_id:
+                        # >= 24h out → actually book it, then email the result.
+                        print(f"[full_watch] OPEN: {w['class_name']} on {date} ({match['open']} spot) — booking (>=24h out).")
+                        result = signup_for_class(session, class_id, match["class_date"])
+                        if "session expired" in result.lower():
+                            trigger_host_reauth()
+                            session = get_bot_session()
+                            result = signup_for_class(session, class_id, match["class_date"])
+                        success = "successfully booked" in result.lower()
+                        emailed = send_booking_email(w, result, success, source="notify auto-book")
+                        bump("booked" if success else "book_failed")
+                        bump("emails_sent" if emailed else "emails_failed")
+                        w["status"] = "booked" if success else "book_failed"
+                        w["result"] = result
+                        w["booked_at"] = now.isoformat()
+                        append_log({
+                            "time": now.isoformat(), "action": "notify_book",
+                            "class": w["class_name"], "date": w.get("class_date"),
+                            "result": result, "success": success,
+                        })
+                    else:
+                        # < 24h out (or no class_id) → notify only, don't book.
+                        print(f"[full_watch] OPEN: {w['class_name']} on {date} ({match['open']} spot) — within 24h, emailing only.")
+                        sent = send_open_email(w, match["open"])
+                        bump("emails_sent" if sent else "emails_failed")
+                        w["status"] = "opened"
+                        w["opened_at"] = now.isoformat()
+                        w["emailed"] = sent
+                        append_log({
+                            "time": now.isoformat(), "action": "notify_open",
+                            "class": w["class_name"], "date": w.get("class_date"),
+                            "open": match["open"], "emailed": sent,
+                        })
+                # else: still full — checked silently
+        if changed:
+            save_watchlist(watchlist)
+    except Exception as e:
+        print(f"[full_watch] Error: {e}")
+    finally:
+        schedule_next_full_check()
 
 
 # --- Routes ---
@@ -399,6 +709,19 @@ def api_watchlist():
     now = datetime.now()
     # Enrich with computed open times and scheduler info
     for w in watchlist:
+        if w.get("mode") == "notify":
+            # Notify-watches don't have a signup-open countdown; phase tracks status.
+            w["open_time"] = None
+            w["reauth_time"] = None
+            w["opens_in"] = None
+            st = w.get("status")
+            w["phase"] = {
+                "booked": "done",
+                "book_failed": "error",
+                "opened": "opened",
+                "expired": "expired",
+            }.get(st, "notify")
+            continue
         class_dt = parse_class_datetime(w.get("class_date", ""), w.get("time", ""))
         if class_dt:
             open_time = compute_open_time(class_dt)
@@ -429,6 +752,9 @@ def api_watch():
     data = request.json
     watchlist = load_watchlist()
 
+    # mode: "autobook" (snag when signup opens) or "notify" (email when a full class frees up)
+    mode = data.get("mode", "autobook")
+
     entry = {
         "class_name": data["name"],
         "class_date": data.get("class_date", ""),
@@ -436,7 +762,8 @@ def api_watch():
         "time": data.get("time", ""),
         "teacher": data.get("teacher", ""),
         "date_label": data.get("date", ""),
-        "status": "waiting",
+        "mode": mode,
+        "status": "watching" if mode == "notify" else "waiting",
         "added_at": datetime.now().isoformat(),
     }
 
@@ -450,14 +777,18 @@ def api_watch():
     watchlist.append(entry)
     save_watchlist(watchlist)
 
-    # Schedule the snag for this class
-    schedule_snag(entry)
+    if mode == "notify":
+        # Picked up by the recurring checker; run a check soon so it works right away.
+        schedule_next_full_check(delay=5)
+        return jsonify({"status": "added", "mode": "notify"})
 
+    # autobook: schedule the snag for this class
+    schedule_snag(entry)
     class_dt = parse_class_datetime(entry["class_date"], entry["time"])
     open_time = compute_open_time(class_dt) if class_dt else None
-
     return jsonify({
         "status": "added",
+        "mode": "autobook",
         "open_time": open_time.isoformat() if open_time else None,
     })
 
@@ -506,12 +837,18 @@ def api_book():
     try:
         result = signup_for_class(session, class_id, class_date)
 
-        # If session expired, re-auth and retry once
+        # If session expired, re-auth via the host headed login and retry once
         if "session expired" in result.lower():
-            print("[api_book] Session expired, re-authing and retrying...")
-            force_reauth()
+            print("[api_book] Session expired, requesting host reauth and retrying...")
+            trigger_host_reauth()
             session = get_bot_session()
             result = signup_for_class(session, class_id, class_date)
+
+        success = "successfully booked" in result.lower()
+        info = _find_cached_class(class_id, class_date) or {"class_id": class_id, "class_date": class_date}
+        emailed = send_booking_email(info, result, success, source="manual book")
+        bump("booked" if success else "book_failed")
+        bump("emails_sent" if emailed else "emails_failed")
 
         append_log({
             "time": datetime.now().isoformat(),
@@ -544,18 +881,48 @@ def api_upload_cookies():
         json.dump(data, f)
 
     # Apply to current session
+    global _user_name
+    _user_name = None  # re-resolve name for the new session
     with _session_lock:
         import requests as req
         _session = req.Session()
         _session.headers.update(HEADERS)
         apply_cookies(_session, data)
 
+    bump("cookie_uploads")
     cookie_names = list(data.keys())
     has_auth = "idsrvauth" in cookie_names
     print(f"[upload-cookies] Received {len(data)} cookies. Has idsrvauth: {has_auth}")
     print(f"[upload-cookies] Cookie names: {cookie_names}")
 
     return jsonify({"status": "ok", "cookies": len(data), "has_idsrvauth": has_auth})
+
+
+_user_name = None  # cached display name of the signed-in member
+
+
+@app.route("/api/auth-status")
+def api_auth_status():
+    """Report whether the current session is truly authenticated (has idsrvauth),
+    and the signed-in member's name."""
+    global _user_name
+    has = bool(_session) and any(c.name == "idsrvauth" for c in _session.cookies)
+    if has and not _user_name:
+        try:
+            _user_name = get_user_name(_session)
+        except Exception:
+            _user_name = None
+    return jsonify({"authenticated": has, "user": _user_name if has else None})
+
+
+@app.route("/api/request-reauth", methods=["POST"])
+def api_request_reauth():
+    """Drop a flag in the shared /data volume. A host-side watcher picks this up
+    and runs the headed Chrome login, then uploads fresh cookies. Lets you force
+    a re-auth remotely (e.g. from your phone via the public URL)."""
+    _write_reauth_flag()
+    print("[reauth] Remote re-auth requested — flag written for host watcher.")
+    return jsonify({"status": "reauth requested"})
 
 
 # --- Eager session init ---
@@ -572,8 +939,24 @@ scheduler.add_job(refresh_default_cache, "interval", minutes=5, id="refresh_cach
 scheduler.add_job(schedule_all_watches, trigger=DateTrigger(run_date=datetime.now() + timedelta(seconds=15)),
                   id="init_watches")
 
+# Start the "notify when a full class opens" checker (first run 20s after boot,
+# then self-reschedules every 5-10 min)
+scheduler.add_job(check_full_watches, trigger=DateTrigger(run_date=datetime.now() + timedelta(seconds=20)),
+                  id="full_watch_check")
+
+# Hourly activity recap
+scheduler.add_job(hourly_recap, "interval", hours=1, id="hourly_recap")
+
+# Shortly after boot, self-heal auth via the host login if we're not authenticated
+scheduler.add_job(boot_auth_heal, trigger=DateTrigger(run_date=datetime.now() + timedelta(seconds=25)),
+                  id="boot_auth_heal")
+
+# Hourly: verify we still have a valid idsrvauth session, reauth via host if not
+scheduler.add_job(hourly_auth_check, "interval", hours=1, id="hourly_auth_check",
+                  next_run_time=datetime.now() + timedelta(minutes=30))
+
 scheduler.start()
-print("Scheduler started — cache refresh in 10s, watch scheduling in 15s")
+print("Scheduler started — cache refresh in 10s, watch scheduling in 15s, full-watch check in 20s")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))

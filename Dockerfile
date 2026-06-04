@@ -22,4 +22,7 @@ COPY api/ ./api/
 
 WORKDIR /app/api
 
-CMD sh -c "gunicorn app:app --bind 0.0.0.0:${PORT:-5050} --workers 1 --threads 2 --preload --timeout 120 --access-logfile -"
+# NOTE: no --preload. Startup code (session-init thread + APScheduler) runs at
+# import time; with --preload it runs in the master and dies on fork, leaving the
+# worker with an unset _boot_done and empty cache. Importing per-worker fixes that.
+CMD sh -c "gunicorn app:app --bind 0.0.0.0:${PORT:-5050} --workers 1 --threads 2 --timeout 120"
