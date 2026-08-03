@@ -14,7 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from flask import Flask, Response, jsonify, render_template, request
 
-from bot import get_classes, get_session, signup_for_class, login_with_playwright, get_credentials, apply_cookies, save_cookie_jar, check_session, get_user_name, HEADERS, COOKIE_JAR_FILE, BASE_URL
+from bot import get_classes, get_session, signup_for_class, login_with_playwright, get_credentials, apply_cookies, save_cookie_jar, load_cookie_jar, check_session, get_user_name, get_client_id, get_server_time, RateLimited, HEADERS, COOKIE_JAR_FILE, BASE_URL
 
 app = Flask(__name__)
 
@@ -41,13 +41,91 @@ class _BootLogCapture:
 sys.stdout = _BootLogCapture(_original_stdout)
 
 DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
-WATCHLIST_FILE = os.path.join(DATA_DIR, "watchlist.json")
 LOG_FILE = os.path.join(DATA_DIR, "booking_log.json")
+
+
+# --- Accounts (switchable; only the selected account is active at a time) ---
+def _envq(key, default=""):
+    """Read an env var, stripping one layer of surrounding quotes (Docker's
+    --env-file keeps quotes literal)."""
+    v = os.environ.get(key, default)
+    if v and len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1]
+    return v
+
+
+def _load_accounts():
+    """Accounts come from MB1_*, MB2_, ... env vars (falls back to MB_* as one account)."""
+    accts = []
+    for i in range(1, 6):
+        email = _envq(f"MB{i}_EMAIL")
+        pw = _envq(f"MB{i}_PASSWORD")
+        if email and pw:
+            accts.append({"id": str(i), "name": _envq(f"MB{i}_NAME") or email.split("@")[0],
+                          "email": email, "password": pw})
+    if not accts:
+        email, pw = _envq("MB_EMAIL"), _envq("MB_PASSWORD")
+        if email and pw:
+            accts.append({"id": "1", "name": email.split("@")[0], "email": email, "password": pw})
+    return accts
+
+
+ACCOUNTS = _load_accounts()
+ACCOUNTS_BY_ID = {a["id"]: a for a in ACCOUNTS}
+_ACTIVE_FILE = os.path.join(DATA_DIR, "active_account")
+
+
+def cookie_jar_path(aid):
+    return os.path.join(DATA_DIR, f"cookie_jar_{aid}.json")
+
+
+def watchlist_path(aid):
+    return os.path.join(DATA_DIR, f"watchlist_{aid}.json")
+
+
+def _read_active_id():
+    try:
+        with open(_ACTIVE_FILE) as f:
+            aid = f.read().strip()
+        if aid in ACCOUNTS_BY_ID:
+            return aid
+    except Exception:
+        pass
+    return ACCOUNTS[0]["id"] if ACCOUNTS else "1"
+
+
+def active_account():
+    return ACCOUNTS_BY_ID.get(_active_id) or (ACCOUNTS[0] if ACCOUNTS
+                                              else {"id": "1", "name": "?", "email": "", "password": ""})
+
+
+def _migrate_legacy_files():
+    """Move pre-multi-account files to the default account's per-account files."""
+    if not ACCOUNTS:
+        return
+    did = ACCOUNTS[0]["id"]
+    for legacy, dest in [(os.path.join(DATA_DIR, ".cookie_jar.json"), cookie_jar_path(did)),
+                         (os.path.join(DATA_DIR, "watchlist.json"), watchlist_path(did))]:
+        if os.path.exists(legacy) and not os.path.exists(dest):
+            try:
+                os.rename(legacy, dest)
+                print(f"[account] Migrated {os.path.basename(legacy)} -> account {did}")
+            except Exception as e:
+                print(f"[account] migration of {legacy} failed: {e}")
+
+
+_migrate_legacy_files()
+_active_id = _read_active_id()
 
 # Signup opens exactly 1 week + 15 minutes before class start
 SIGNUP_OFFSET = timedelta(weeks=1, minutes=15)
 # Re-auth 5 minutes before signup opens
 REAUTH_BEFORE = timedelta(minutes=5)
+# Fast-snag tuning: start polling this early, keep trying this long past open.
+# The burst's job is to win the instant spots exist at open; later drops are
+# handled by the notify fallback, so the window stays short to limit requests.
+SNAG_LEAD = timedelta(seconds=3)
+SNAG_WINDOW = timedelta(seconds=12)
 
 # "Notify when a full class opens up" — re-check on a randomized interval
 FULL_CHECK_MIN = 300  # 5 min
@@ -66,6 +144,31 @@ def bump(key, n=1):
     with _stats_lock:
         STATS[key] = STATS.get(key, 0) + n
 
+
+# Snapshot of the most recent check_full_watches run, surfaced in the Debug tab.
+_full_check_lock = threading.Lock()
+_last_full_check = {"ran_at": None, "duration_ms": None, "note": "", "items": []}
+
+# clientId (MindBody member ID) is account-stable, so fetch it once per account and
+# cache it. Needed by res_deb now that the res_a step (which used to supply it) is gone.
+_client_id_lock = threading.Lock()
+_client_id_cache = {}  # account_id -> clientId
+
+
+def resolve_client_id(session):
+    """Cached clientId for the active account; fetches from main_info.asp on first use."""
+    aid = _active_id
+    with _client_id_lock:
+        cid = _client_id_cache.get(aid)
+    if cid:
+        return cid
+    cid = get_client_id(session) or ""
+    if cid:
+        with _client_id_lock:
+            _client_id_cache[aid] = cid
+        print(f"[client-id] cached {cid} for account {aid}")
+    return cid
+
 # Global session
 _session = None
 _session_lock = threading.Lock()
@@ -76,14 +179,21 @@ _cache_lock = threading.Lock()
 CACHE_TTL = 300  # 5 minutes
 
 
+def _build_session_for_active():
+    acct = active_account()
+    print(f"[app] Initializing session for {acct['name']} ({acct['email']})...")
+    s = get_session(email=acct["email"], password=acct["password"],
+                    cookie_jar_file=cookie_jar_path(acct["id"]))
+    print("[app] Bot session ready.")
+    return s
+
+
 def get_bot_session():
     global _session
     _boot_done.wait()  # block until startup init finishes
     with _session_lock:
         if _session is None:
-            print("[app] Initializing bot session...")
-            _session = get_session()
-            print("[app] Bot session ready.")
+            _session = _build_session_for_active()
         return _session
 
 
@@ -92,14 +202,57 @@ def _init_session_background():
     global _session
     try:
         with _session_lock:
-            print("[app] Initializing bot session...")
-            _session = get_session()
-            print("[app] Bot session ready.")
+            _session = _build_session_for_active()
     except Exception as e:
         print(f"[app] Session init failed: {e}")
     finally:
         _boot_done.set()
         sys.stdout = _original_stdout
+
+
+def _session_from_jar(acct):
+    """Build a session from an account's saved cookie jar only (no login). Returns
+    the session if the jar is valid, else None. Keeps account-switching fast."""
+    import requests as req
+    s = req.Session()
+    s.headers.update(HEADERS)
+    if load_cookie_jar(s, cookie_jar_path(acct["id"])) and check_session(s):
+        return s
+    return None
+
+
+def set_active_account(aid: str) -> bool:
+    """Switch the active account: rebuild the session from the new account's saved
+    cookie jar (so the lock is accurate immediately; full login happens lazily only
+    if needed), persist the choice, and reschedule autobook snags for the new
+    account's watchlist (only the active account is monitored)."""
+    global _active_id, _session, _user_name
+    if aid not in ACCOUNTS_BY_ID:
+        return False
+    with _session_lock:
+        _active_id = aid
+        _session = _session_from_jar(ACCOUNTS_BY_ID[aid])
+    _user_name = None
+    try:
+        with open(_ACTIVE_FILE, "w") as f:
+            f.write(aid)
+    except Exception as e:
+        print(f"[account] Failed to persist active account: {e}")
+    print(f"[account] Switched active account -> {active_account()['name']}")
+    _reschedule_active_snags()
+    return True
+
+
+def _reschedule_active_snags():
+    """Cancel all snag/reauth jobs (from the previous account) and reschedule for the
+    now-active account's watchlist."""
+    try:
+        for job in scheduler.get_jobs():
+            if job.id.startswith("snag_") or job.id.startswith("reauth_"):
+                scheduler.remove_job(job.id)
+    except Exception as e:
+        print(f"[account] snag cleanup error: {e}")
+    schedule_all_watches()
 
 
 def _is_authed() -> bool:
@@ -140,17 +293,17 @@ def force_reauth():
     """Headless re-auth fallback (often blocked by reCAPTCHA). Prefer trigger_host_reauth."""
     global _session
     bump("reauths")
-    print("[reauth] Forcing re-authentication (headless fallback)...")
+    acct = active_account()
+    print(f"[reauth] Forcing headless re-auth for {acct['name']} (fallback)...")
     with _session_lock:
         import requests as req
         _session = req.Session()
         _session.headers.update(HEADERS)
-        email, password = get_credentials()
-        cookies = login_with_playwright(email, password)
+        cookies = login_with_playwright(acct["email"], acct["password"])
         apply_cookies(_session, cookies)
         # Save cookie jar
         import json as _json
-        with open(COOKIE_JAR_FILE, "w") as f:
+        with open(cookie_jar_path(acct["id"]), "w") as f:
             _json.dump(cookies, f)
         has_auth = any(c.name == "idsrvauth" for c in _session.cookies)
         print(f"[reauth] Done. Has idsrvauth: {has_auth}")
@@ -190,7 +343,7 @@ def hourly_auth_check():
 
 def get_cached_classes(date="", location="0", category="0", force=False):
     """Return classes from cache if fresh, otherwise fetch and cache."""
-    cache_key = (date, location, category)
+    cache_key = (_active_id, date, location, category)
     now = _time.time()
 
     with _cache_lock:
@@ -218,31 +371,54 @@ def refresh_default_cache():
 
 # --- Watchlist helpers ---
 
-def load_watchlist() -> list[dict]:
-    if os.path.exists(WATCHLIST_FILE):
-        with open(WATCHLIST_FILE) as f:
+# Serialize all watchlist/log file writes; multiple booking threads can run at once.
+_io_lock = threading.Lock()
+
+
+def _read_json_list(path) -> list:
+    """Read a JSON array, tolerating corruption (e.g. an interrupted concurrent write)."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
             return json.load(f)
-    return []
+    except (json.JSONDecodeError, ValueError):
+        try:  # salvage the first valid array, ignore trailing garbage
+            with open(path) as f:
+                obj, _ = json.JSONDecoder().raw_decode(f.read().lstrip())
+            return obj if isinstance(obj, list) else []
+        except Exception:
+            return []
+
+
+def _write_json(path, data):
+    """Atomic write (temp file + rename) so a reader never sees a half-written file."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def load_watchlist() -> list[dict]:
+    with _io_lock:
+        return _read_json_list(watchlist_path(_active_id))
 
 
 def save_watchlist(watchlist: list[dict]):
-    with open(WATCHLIST_FILE, "w") as f:
-        json.dump(watchlist, f, indent=2)
+    with _io_lock:
+        _write_json(watchlist_path(_active_id), watchlist)
 
 
 def load_log() -> list[dict]:
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE) as f:
-            return json.load(f)
-    return []
+    with _io_lock:
+        return _read_json_list(LOG_FILE)
 
 
 def append_log(entry: dict):
-    log = load_log()
-    log.insert(0, entry)
-    log = log[:100]
-    with open(LOG_FILE, "w") as f:
-        json.dump(log, f, indent=2)
+    with _io_lock:
+        log = _read_json_list(LOG_FILE)
+        log.insert(0, entry)
+        _write_json(LOG_FILE, log[:100])
 
 
 # --- Precise booking scheduler ---
@@ -309,118 +485,286 @@ def schedule_snag(watch: dict):
     else:
         print(f"[snag]   Re-auth time already passed, skipping")
 
-    # Schedule rapid booking attempts starting at open time
+    # Schedule rapid booking — start SNAG_LEAD before open so we're already polling
+    # the instant the signup button flips.
     snag_job_id = f"snag_{safe_id}"
-    if open_time > now:
+    snag_start = open_time - SNAG_LEAD
+    if snag_start > now:
         try:
             scheduler.remove_job(snag_job_id)
         except Exception:
             pass
         scheduler.add_job(
             rapid_book,
-            trigger=DateTrigger(run_date=open_time),
+            trigger=DateTrigger(run_date=snag_start),
             args=[watch],
             id=snag_job_id,
             replace_existing=True,
         )
-        print(f"[snag]   Booking scheduled for {open_time}")
-    elif open_time > now - timedelta(minutes=5):
-        # Signup just opened recently — try immediately
-        print(f"[snag]   Signup just opened, attempting now...")
+        print(f"[snag]   Booking burst scheduled for {snag_start} (open {open_time})")
+    elif class_dt > now:
+        # Signup is already open (or within the lead) and the class is upcoming → go now.
+        print(f"[snag]   Signup already open — attempting to book now...")
         threading.Thread(target=rapid_book, args=[watch], daemon=True).start()
     else:
-        print(f"[snag]   Signup opened long ago — will try on next cache refresh")
+        print(f"[snag]   Class already passed — not booking.")
+
+
+def _sleep_until(target):
+    """Block until the container wall-clock reaches `target` (naive local datetime).
+    Coarse-sleeps to within ~10ms then busy-spins the remainder for tight precision,
+    so a scheduled get_classes() call goes out at the instant we intend."""
+    while True:
+        rem = (target - datetime.now()).total_seconds()
+        if rem <= 0:
+            return
+        if rem > 0.02:
+            _time.sleep(rem - 0.01)
+        # else: tight spin through the final ~10-20ms
+
+
+def _clone_session(src):
+    """Shallow copy of a requests.Session (headers, cookies, proxies) so a dedicated
+    thread can issue requests concurrently without sharing one Session across threads
+    (requests.Session isn't safe for simultaneous use from multiple threads)."""
+    import requests as req
+    s = req.Session()
+    s.headers.update(dict(src.headers))
+    for c in src.cookies:
+        s.cookies.set_cookie(c)
+    s.proxies.update(dict(src.proxies))
+    return s
 
 
 def rapid_book(watch: dict):
     """
-    Rapid-fire booking: try every 2 seconds for 60 seconds.
-    The signup link may take a moment to appear after the open time.
+    Fast auto-book at signup-open. Polls the schedule back-to-back (no fixed 2s
+    gap), aligned to MindBody's clock, from ~SNAG_LEAD before open until
+    SNAG_WINDOW after. The instant the signup button appears it books with the
+    real tg/clsLoc. Relies on the re-auth scheduled 5 min before open (no
+    validity round-trip on the hot path). If it still doesn't get a spot, the
+    watch is converted to a notify watch so it keeps polling for openings.
+
+    Timing guarantee: regardless of poll cadence or backoff, a get_classes() call
+    is fired at exactly open-0.2s and at open (container clock), each on its own
+    thread, so we catch the button the instant it flips. We're only waiting on
+    get_classes() to hand us the class_id/tg/clsLoc needed to fire the booking.
     """
     class_name = watch.get("class_name", "?")
     class_date = watch.get("class_date", "")
     time_str = watch.get("time", "")
-    print(f"[rapid_book] Starting rapid booking for {class_name} on {class_date} at {time_str}")
+    print(f"[rapid_book] Auto-book burst for {class_name} on {class_date} at {time_str}")
 
     append_log({
-        "time": datetime.now().isoformat(),
-        "action": "snag_started",
-        "class": class_name,
-        "date": class_date,
+        "time": datetime.now().isoformat(), "action": "snag_started",
+        "class": class_name, "date": class_date,
     })
 
-    session = get_bot_session()
-    attempts = 0
-    max_attempts = 30  # 30 attempts * 2s = 60 seconds
+    session = get_bot_session()  # auth ensured by the 5-min-before reauth job
 
-    while attempts < max_attempts:
-        attempts += 1
+    class_dt = parse_class_datetime(class_date, time_str)
+    open_time = compute_open_time(class_dt) if class_dt else datetime.now()
+
+    # Align to MindBody's clock so the burst lands right as signup opens.
+    server_offset = timedelta(0)
+    st = get_server_time(session)
+    if st:
+        server_offset = st - datetime.now()
+        print(f"[rapid_book] server clock offset {server_offset.total_seconds():+.1f}s")
+    # Poll until SNAG_WINDOW past open (server-aligned), but always at least
+    # SNAG_WINDOW from now (covers the already-open catch-up case).
+    deadline_local = max((open_time + SNAG_WINDOW) - server_offset,
+                         datetime.now() + SNAG_WINDOW)
+
+    # Resolve clientId now (during the lead) so the booking step doesn't need res_a.
+    client_id = resolve_client_id(session)
+    print(f"[rapid_book] using clientId={client_id!r}")
+
+    # Shared booking state across the main loop and the dedicated aligned-shot threads.
+    book_lock = threading.Lock()
+    booked_evt = threading.Event()
+    state = {"last_reason": "signup row never appeared", "found": {}, "attempts": 0}
+    book_info = {"class_name": class_name, "class_date": class_date,
+                 "time": time_str, "teacher": watch.get("teacher", "")}
+
+    def _record_success(result):
         now = datetime.now()
-        print(f"[rapid_book] Attempt {attempts}/{max_attempts} at {now.strftime('%H:%M:%S')}")
+        watchlist = load_watchlist()
+        for w in watchlist:
+            if (w["class_name"] == class_name
+                    and w.get("class_date") == class_date
+                    and w.get("time") == time_str):
+                w["status"] = "booked"
+                w["result"] = result
+                w["booked_at"] = now.isoformat()
+                if state["found"].get("class_id"):
+                    w["class_id"] = state["found"]["class_id"]
+                break
+        save_watchlist(watchlist)
+        emailed = send_booking_email(book_info, result, True, source="auto-book at signup-open")
+        bump("booked")
+        bump("emails_sent" if emailed else "emails_failed")
+        append_log({
+            "time": now.isoformat(), "action": "snagged", "class": class_name,
+            "date": class_date, "result": result, "attempts": state["attempts"],
+        })
 
+    def attempt(sess, label):
+        """One get_classes() probe; books under lock if a spot is open. Returns an
+        outcome tag (SUCCESS/DONE/FULL/NO_AUTH/OTHER/WAIT). Safe to call concurrently
+        from the aligned-shot threads and the main loop. May raise (RateLimited /
+        network) — callers handle backoff."""
+        if booked_evt.is_set():
+            return "DONE"
+        state["attempts"] += 1
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        if label:
+            print(f"[rapid_book] {ts} ALIGNED SHOT ({label}) — firing get_classes")
+        classes = get_classes(sess, date=class_date, location="0", class_type="0")
+        match = next(
+            (c for c in classes
+             if c["name"] == class_name
+             and c["class_date"] == class_date
+             and c["time"] == time_str),
+            None,
+        )
+        if match is None:
+            state["last_reason"] = "class not listed in schedule"
+            return "WAIT"
+        if not (match.get("has_signup") and match.get("class_id")):
+            state["last_reason"] = "signup not open yet (no signup button)"
+            return "WAIT"
+        tg = match.get("tg") or "28"
+        cls_loc = match.get("cls_loc") or "1"
+        state["found"] = {"class_id": match["class_id"], "tg": tg, "cls_loc": cls_loc}
+        open_n = match.get("open", 0)
+        if open_n <= 0:
+            state["last_reason"] = "FULL"
+            return "FULL"
+        # A spot exists — serialize so the concurrent shots can't double-book.
+        with book_lock:
+            if booked_evt.is_set():
+                return "DONE"
+            who = label or "poll"
+            print(f"[rapid_book] {ts} TRYING open={open_n} id={match['class_id']} "
+                  f"tg={tg} clsLoc={cls_loc}  <{who}>")
+            result = signup_for_class(sess, match["class_id"], match["class_date"],
+                                      tg=tg, cls_loc=cls_loc, client_id=client_id)
+            tag = _classify_book_result(result)
+            print(f"[rapid_book] {ts} [{tag}] {result}  <{who}>")
+            state["last_reason"] = tag
+            if tag == "SUCCESS":
+                _record_success(result)
+                booked_evt.set()
+            return tag
+
+    # Dedicated aligned-shot threads: fire get_classes at EXACTLY open-0.2s and open
+    # (container clock), each on its own cloned session, so the call goes out on time
+    # regardless of what the main loop is doing mid-request.
+    def aligned_shot(target, label, sess):
+        _sleep_until(target)
+        if booked_evt.is_set():
+            return
         try:
-            # Fetch fresh class list to find the class_id
-            classes = get_classes(session, date=class_date, location="0", class_type="0")
-
-            # Find our class
-            for cls in classes:
-                if (cls["has_signup"]
-                        and cls["class_id"]
-                        and cls["name"] == watch.get("class_name")
-                        and cls["class_date"] == class_date
-                        and cls["time"] == time_str):
-
-                    print(f"[rapid_book] Found signup for {class_name}! class_id={cls['class_id']}")
-
-                    result = signup_for_class(session, cls["class_id"], cls["class_date"])
-                    print(f"[rapid_book] RESULT: {result}")
-                    success = "successfully booked" in result.lower()
-
-                    # Update watchlist
-                    watchlist = load_watchlist()
-                    for w in watchlist:
-                        if (w["class_name"] == class_name
-                                and w.get("class_date") == class_date
-                                and w.get("time") == time_str):
-                            w["status"] = "booked" if success else "book_failed"
-                            w["result"] = result
-                            w["booked_at"] = now.isoformat()
-                            w["class_id"] = cls["class_id"]
-                            break
-                    save_watchlist(watchlist)
-
-                    emailed = send_booking_email(
-                        {"class_name": class_name, "class_date": class_date,
-                         "time": time_str, "teacher": watch.get("teacher", "")},
-                        result, success, source="auto-book at signup-open")
-                    bump("booked" if success else "book_failed")
-                    bump("emails_sent" if emailed else "emails_failed")
-
-                    append_log({
-                        "time": now.isoformat(),
-                        "action": "snagged",
-                        "class": class_name,
-                        "date": class_date,
-                        "result": result,
-                        "attempts": attempts,
-                    })
-                    return
-
-            print(f"[rapid_book] Signup not available yet...")
-
+            attempt(sess, label)
+        except RateLimited as e:
+            print(f"[rapid_book] aligned {label} rate-limited: {e}")
         except Exception as e:
-            print(f"[rapid_book] Attempt {attempts} error: {e}")
+            print(f"[rapid_book] aligned {label} error: {type(e).__name__}: {e}")
 
-        _time.sleep(2)
+    shot_threads = []
+    for target, label in ((open_time - timedelta(seconds=0.2), "open-0.2s"),
+                          (open_time, "open+0.0s")):
+        if target > datetime.now():
+            th = threading.Thread(target=aligned_shot,
+                                  args=(target, label, _clone_session(session)),
+                                  daemon=True)
+            th.start()
+            shot_threads.append(th)
 
-    # Exhausted attempts
-    print(f"[rapid_book] Failed to snag {class_name} after {max_attempts} attempts")
+    # Main fallback poll loop: BASE_GAP cadence + exponential backoff. The aligned
+    # threads own the exact open instants; this loop covers the approach and the
+    # post-open window (later drops, or a retry if a shot's booking failed).
+    BASE_GAP = 0.4
+    FULL_GAP = 0.6   # signup open but full — schedule-only polling, go a bit slower
+    MAX_BACKOFF = 8.0
+    backoff_n = 0
+    while not booked_evt.is_set() and datetime.now() < deadline_local:
+        gap = BASE_GAP
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        try:
+            tag = attempt(session, None)
+            backoff_n = 0  # clean read — clear any accumulated backoff
+            if tag in ("SUCCESS", "DONE"):
+                break
+            elif tag == "FULL":
+                gap = FULL_GAP
+            elif tag == "NO_AUTH":
+                print("[rapid_book] Session expired mid-snag — requesting host reauth...")
+                trigger_host_reauth(timeout=120)
+                session = get_bot_session()
+            elif tag == "OTHER":
+                gap = 1.0  # raced and lost between fetch and book — brief back-off
+        except RateLimited as e:
+            backoff_n += 1
+            gap = min(BASE_GAP * (2 ** backoff_n), MAX_BACKOFF)
+            state["last_reason"] = str(e)
+            print(f"[rapid_book] {ts} RATE-LIMITED — backing off to {gap:.1f}s ({e})")
+        except Exception as e:
+            backoff_n += 1
+            gap = min(BASE_GAP * (2 ** backoff_n), MAX_BACKOFF)
+            state["last_reason"] = f"error: {type(e).__name__}: {e}"
+            print(f"[rapid_book] {ts} ERROR (backoff to {gap:.1f}s): {e}")
+        _time.sleep(gap)
+
+    # Let any in-flight aligned shot finish its booking before we decide the outcome.
+    for th in shot_threads:
+        th.join(timeout=2.0)
+    if booked_evt.is_set():
+        return
+
+    # Didn't get a spot at open → convert to a notify watch so it keeps polling
+    # for openings (and auto-books if a spot frees while it's still >=24h out).
+    last_reason = state["last_reason"]
+    found = state["found"]
+    reason = {
+        "FULL": "full at signup-open (didn't get a spot)",
+        "NO_AUTH": "not authenticated (reauth didn't recover in time)",
+        "OTHER": f"unexpected response: {last_reason}",
+        "class not listed in schedule": "class never appeared in the schedule",
+        "signup not open yet (no signup button)": "signup never opened during the window",
+        "signup row never appeared": "signup never opened during the window",
+    }.get(last_reason, last_reason)
+    print(f"[rapid_book] No spot for {class_name} after {state['attempts']} attempts ({reason}). "
+          f"Converting to notify watch to keep polling for openings.")
+
+    watchlist = load_watchlist()
+    for w in watchlist:
+        if (w["class_name"] == class_name
+                and w.get("class_date") == class_date
+                and w.get("time") == time_str):
+            w["mode"] = "notify"
+            w["status"] = "watching"
+            w["result"] = f"Missed at signup-open ({reason}); now watching for openings."
+            if found:
+                w["class_id"] = found["class_id"]
+                w["tg"] = found["tg"]
+                w["cls_loc"] = found["cls_loc"]
+            break
+    save_watchlist(watchlist)
+    schedule_next_full_check(delay=5)  # start polling it soon
+
+    emailed = _send_email(
+        f"Missed at open, now watching: {class_name} — {_class_when(book_info)}",
+        f"Couldn't grab {class_name} the moment signup opened ({reason}).\n\n"
+        f"It's now on your watchlist in notify mode — I'll keep checking for openings and "
+        f"auto-book if a spot frees while it's 24h+ out (or email you if it opens within 24h).\n"
+    )
+    bump("book_failed")
+    bump("emails_sent" if emailed else "emails_failed")
     append_log({
-        "time": datetime.now().isoformat(),
-        "action": "snag_failed",
-        "class": class_name,
-        "date": class_date,
-        "attempts": max_attempts,
+        "time": datetime.now().isoformat(), "action": "snag_failed_now_watching",
+        "class": class_name, "date": class_date, "attempts": attempts, "reason": reason,
     })
 
 
@@ -456,16 +800,6 @@ def hourly_recap():
 
 # --- "Notify when a full class opens up" ---
 
-def _envq(key, default=""):
-    """Read an env var, stripping one layer of surrounding quotes.
-    Docker's --env-file keeps quotes literal (e.g. SMTP_PASS='"abc"'), so we
-    normalize here to be resilient to however .env is quoted."""
-    v = os.environ.get(key, default)
-    if v and len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-        v = v[1:-1]
-    return v
-
-
 def _send_email(subject: str, body: str) -> bool:
     """Send an email via SMTP to all configured recipients (NOTIFY_EMAIL may be a
     comma-separated list; falls back to MB_EMAIL, then the sender). True on success."""
@@ -498,6 +832,26 @@ def _send_email(subject: str, body: str) -> bool:
     except Exception as e:
         print(f"[email] Failed to send: {e}")
         return False
+
+
+def _booking_succeeded(result: str) -> bool:
+    """signup_for_class returns different success strings depending on the flow:
+    'Successfully booked ...' (direct) or the raw confirmation 'You've Booked: ...'
+    (via my_sch.asp). Match either, so a real booking isn't reported as failed."""
+    r = (result or "").lower()
+    return "successfully booked" in r or "you've booked" in r
+
+
+def _classify_book_result(result: str) -> str:
+    """Categorize a signup_for_class result: SUCCESS / FULL / NO_AUTH / OTHER."""
+    r = (result or "").lower()
+    if _booking_succeeded(result):
+        return "SUCCESS"
+    if "is full" in r:
+        return "FULL"
+    if "session expired" in r:
+        return "NO_AUTH"
+    return "OTHER"
 
 
 def _class_when(info: dict) -> str:
@@ -564,10 +918,14 @@ def check_full_watches():
     """Re-check every 'notify' watch: if a spot opened, email the user (no booking).
     Self-reschedules with a fresh random delay each run."""
     bump("checks")
+    started = _time.time()
+    run_items = []  # per-watch outcome for this run (surfaced in the Debug tab)
+    note = ""
     try:
         watchlist = load_watchlist()
         pending = [w for w in watchlist if w.get("mode") == "notify" and w.get("status") == "watching"]
         if not pending:
+            note = "no active notify watches"
             return
 
         now = datetime.now()
@@ -582,12 +940,17 @@ def check_full_watches():
                 classes = get_classes(session, date=date, location="0", class_type="0")
             except Exception as e:
                 print(f"[full_watch] Fetch error for {date}: {e}")
+                for w in watches:
+                    run_items.append({"name": w.get("class_name"), "date": w.get("class_date"),
+                                      "time": w.get("time"), "status": "fetch_error", "open": 0})
                 continue
             for w in watches:
                 class_dt = parse_class_datetime(w.get("class_date", ""), w.get("time", ""))
                 if class_dt and class_dt < now:
                     w["status"] = "expired"
                     changed = True
+                    run_items.append({"name": w.get("class_name"), "date": w.get("class_date"),
+                                      "time": w.get("time"), "status": "expired", "open": 0})
                     print(f"[full_watch] {w['class_name']} on {date} expired (class passed).")
                     continue
                 match = next(
@@ -598,8 +961,15 @@ def check_full_watches():
                     None,
                 )
                 if not match:
+                    run_items.append({"name": w.get("class_name"), "date": w.get("class_date"),
+                                      "time": w.get("time"), "status": "not_found", "open": 0})
                     continue
-                if match.get("has_signup") and match.get("open", 0) > 0:
+                open_n = match.get("open", 0) or 0
+                is_open = bool(match.get("has_signup")) and open_n > 0
+                run_items.append({"name": w.get("class_name"), "date": w.get("class_date"),
+                                  "time": w.get("time"), "status": "open" if is_open else "full",
+                                  "open": open_n})
+                if is_open:
                     bump("opens")
                     class_id = match.get("class_id") or w.get("class_id")
                     w["open_spots"] = match["open"]
@@ -609,13 +979,16 @@ def check_full_watches():
                     far_enough = class_dt is not None and (class_dt - now) >= BOOK_LEAD_TIME
                     if far_enough and class_id:
                         # >= 24h out → actually book it, then email the result.
-                        print(f"[full_watch] OPEN: {w['class_name']} on {date} ({match['open']} spot) — booking (>=24h out).")
-                        result = signup_for_class(session, class_id, match["class_date"])
+                        tg = match.get("tg") or "28"
+                        cls_loc = match.get("cls_loc") or "1"
+                        print(f"[full_watch] OPEN: {w['class_name']} on {date} ({match['open']} spot) — booking (>=24h out, tg={tg} clsLoc={cls_loc}).")
+                        cid = resolve_client_id(session)
+                        result = signup_for_class(session, class_id, match["class_date"], tg=tg, cls_loc=cls_loc, client_id=cid)
                         if "session expired" in result.lower():
                             trigger_host_reauth()
                             session = get_bot_session()
-                            result = signup_for_class(session, class_id, match["class_date"])
-                        success = "successfully booked" in result.lower()
+                            result = signup_for_class(session, class_id, match["class_date"], tg=tg, cls_loc=cls_loc, client_id=cid)
+                        success = _booking_succeeded(result)
                         emailed = send_booking_email(w, result, success, source="notify auto-book")
                         bump("booked" if success else "book_failed")
                         bump("emails_sent" if emailed else "emails_failed")
@@ -645,7 +1018,13 @@ def check_full_watches():
             save_watchlist(watchlist)
     except Exception as e:
         print(f"[full_watch] Error: {e}")
+        note = note or f"error: {e}"
     finally:
+        with _full_check_lock:
+            _last_full_check["ran_at"] = datetime.now().isoformat()
+            _last_full_check["duration_ms"] = round((_time.time() - started) * 1000)
+            _last_full_check["note"] = note
+            _last_full_check["items"] = run_items
         schedule_next_full_check()
 
 
@@ -675,6 +1054,49 @@ def api_boot_log():
 
     return Response(stream(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/debug/jobs")
+def api_debug_jobs():
+    """List all scheduled APScheduler jobs with their next run time. Used by the
+    Debug tab to confirm jobs are registered and firing as expected."""
+    now = datetime.now()
+    jobs = []
+    for job in scheduler.get_jobs():
+        nrt = job.next_run_time  # None if the job is paused / has no future run
+        secs = (nrt - now.astimezone(nrt.tzinfo)).total_seconds() if nrt else None
+        jobs.append({
+            "id": job.id,
+            "name": job.name,
+            "trigger": str(job.trigger),
+            "next_run": nrt.isoformat() if nrt else None,
+            "seconds_until": round(secs) if secs is not None else None,
+            "paused": nrt is None,
+        })
+    jobs.sort(key=lambda j: (j["seconds_until"] is None, j["seconds_until"] or 0))
+    return jsonify({
+        "running": scheduler.running,
+        "now": now.isoformat(),
+        "count": len(jobs),
+        "jobs": jobs,
+    })
+
+
+@app.route("/api/debug/full-check")
+def api_debug_full_check():
+    """Results of the most recent check_full_watches run: per-item open/full status.
+    Used by the Debug tab."""
+    with _full_check_lock:
+        snap = dict(_last_full_check)
+        snap["items"] = [dict(i) for i in _last_full_check["items"]]
+    items = snap["items"]
+    snap["summary"] = {
+        "total": len(items),
+        "open": sum(1 for i in items if i["status"] == "open"),
+        "full": sum(1 for i in items if i["status"] == "full"),
+        "other": sum(1 for i in items if i["status"] not in ("open", "full")),
+    }
+    return jsonify(snap)
 
 
 @app.route("/api/classes")
@@ -709,6 +1131,8 @@ def api_watchlist():
     now = datetime.now()
     # Enrich with computed open times and scheduler info
     for w in watchlist:
+        class_dt = parse_class_datetime(w.get("class_date", ""), w.get("time", ""))
+        w["class_dt"] = class_dt.isoformat() if class_dt else None  # sort key for the UI
         if w.get("mode") == "notify":
             # Notify-watches don't have a signup-open countdown; phase tracks status.
             w["open_time"] = None
@@ -722,7 +1146,6 @@ def api_watchlist():
                 "expired": "expired",
             }.get(st, "notify")
             continue
-        class_dt = parse_class_datetime(w.get("class_date", ""), w.get("time", ""))
         if class_dt:
             open_time = compute_open_time(class_dt)
             reauth_time = compute_reauth_time(open_time)
@@ -759,6 +1182,8 @@ def api_watch():
         "class_name": data["name"],
         "class_date": data.get("class_date", ""),
         "class_id": data.get("class_id"),
+        "tg": data.get("tg"),
+        "cls_loc": data.get("cls_loc"),
         "time": data.get("time", ""),
         "teacher": data.get("teacher", ""),
         "date_label": data.get("date", ""),
@@ -832,19 +1257,22 @@ def api_book():
     class_date = data.get("class_date")
     if not class_id or not class_date:
         return jsonify({"error": "Missing class_id or class_date"}), 400
+    tg = data.get("tg") or "28"
+    cls_loc = data.get("cls_loc") or "1"
 
     session = get_bot_session()
     try:
-        result = signup_for_class(session, class_id, class_date)
+        cid = resolve_client_id(session)
+        result = signup_for_class(session, class_id, class_date, tg=tg, cls_loc=cls_loc, client_id=cid)
 
         # If session expired, re-auth via the host headed login and retry once
         if "session expired" in result.lower():
             print("[api_book] Session expired, requesting host reauth and retrying...")
             trigger_host_reauth()
             session = get_bot_session()
-            result = signup_for_class(session, class_id, class_date)
+            result = signup_for_class(session, class_id, class_date, tg=tg, cls_loc=cls_loc, client_id=cid)
 
-        success = "successfully booked" in result.lower()
+        success = _booking_succeeded(result)
         info = _find_cached_class(class_id, class_date) or {"class_id": class_id, "class_date": class_date}
         emailed = send_booking_email(info, result, success, source="manual book")
         bump("booked" if success else "book_failed")
@@ -869,33 +1297,33 @@ def api_log():
 
 @app.route("/api/upload-cookies", methods=["POST"])
 def api_upload_cookies():
-    """Upload cookies from local login to Railway's persistent storage."""
-    global _session
+    """Receive cookies from the host headed login and store them for the given
+    account (defaults to the active one). Refreshes the live session if it's for
+    the active account."""
+    global _session, _user_name
     data = request.json
     if not data or not isinstance(data, dict):
         return jsonify({"error": "POST a JSON dict of cookies"}), 400
 
-    # Save to persistent volume
-    from bot import COOKIE_JAR_FILE
-    with open(COOKIE_JAR_FILE, "w") as f:
+    aid = request.args.get("account") or _active_id
+    if aid not in ACCOUNTS_BY_ID:
+        aid = _active_id
+
+    with open(cookie_jar_path(aid), "w") as f:
         json.dump(data, f)
 
-    # Apply to current session
-    global _user_name
-    _user_name = None  # re-resolve name for the new session
-    with _session_lock:
-        import requests as req
-        _session = req.Session()
-        _session.headers.update(HEADERS)
-        apply_cookies(_session, data)
+    has_auth = "idsrvauth" in data
+    if aid == _active_id:
+        _user_name = None  # re-resolve name for the refreshed session
+        with _session_lock:
+            import requests as req
+            _session = req.Session()
+            _session.headers.update(HEADERS)
+            apply_cookies(_session, data)
 
     bump("cookie_uploads")
-    cookie_names = list(data.keys())
-    has_auth = "idsrvauth" in cookie_names
-    print(f"[upload-cookies] Received {len(data)} cookies. Has idsrvauth: {has_auth}")
-    print(f"[upload-cookies] Cookie names: {cookie_names}")
-
-    return jsonify({"status": "ok", "cookies": len(data), "has_idsrvauth": has_auth})
+    print(f"[upload-cookies] account {aid}: {len(data)} cookies, idsrvauth={has_auth}")
+    return jsonify({"status": "ok", "account": aid, "cookies": len(data), "has_idsrvauth": has_auth})
 
 
 _user_name = None  # cached display name of the signed-in member
@@ -903,16 +1331,45 @@ _user_name = None  # cached display name of the signed-in member
 
 @app.route("/api/auth-status")
 def api_auth_status():
-    """Report whether the current session is truly authenticated (has idsrvauth),
-    and the signed-in member's name."""
+    """Report whether the active account's session is authenticated (has idsrvauth),
+    the signed-in member's name, and which account is active."""
     global _user_name
+    acct = active_account()
     has = bool(_session) and any(c.name == "idsrvauth" for c in _session.cookies)
     if has and not _user_name:
         try:
             _user_name = get_user_name(_session)
         except Exception:
             _user_name = None
-    return jsonify({"authenticated": has, "user": _user_name if has else None})
+    return jsonify({"authenticated": has, "user": _user_name if has else None,
+                    "account_id": acct["id"], "account_name": acct["name"]})
+
+
+@app.route("/api/accounts")
+def api_accounts():
+    """List configured accounts and which is active (for the switcher dropdown)."""
+    return jsonify({
+        "active": _active_id,
+        "accounts": [{"id": a["id"], "name": a["name"], "email": a["email"],
+                      "active": a["id"] == _active_id} for a in ACCOUNTS],
+    })
+
+
+@app.route("/api/active-account")
+def api_active_account():
+    """The active account's id/name/email — used by the host login helper."""
+    a = active_account()
+    return jsonify({"id": a["id"], "name": a["name"], "email": a["email"]})
+
+
+@app.route("/api/switch-account", methods=["POST"])
+def api_switch_account():
+    """Switch the active account."""
+    data = request.json or {}
+    aid = str(data.get("id", ""))
+    if not set_active_account(aid):
+        return jsonify({"error": f"unknown account id {aid}"}), 400
+    return jsonify({"status": "switched", "active": _active_id, "name": active_account()["name"]})
 
 
 @app.route("/api/request-reauth", methods=["POST"])

@@ -21,7 +21,7 @@ HEADERS = {
 }
 
 
-def save_cookie_jar(session: requests.Session):
+def save_cookie_jar(session: requests.Session, path: str = COOKIE_JAR_FILE):
     """Save session cookies to disk for reuse."""
     cookies = {}
     for cookie in session.cookies:
@@ -30,15 +30,15 @@ def save_cookie_jar(session: requests.Session):
             "domain": cookie.domain,
             "path": cookie.path,
         }
-    with open(COOKIE_JAR_FILE, "w") as f:
+    with open(path, "w") as f:
         json.dump(cookies, f)
 
 
-def load_cookie_jar(session: requests.Session) -> bool:
+def load_cookie_jar(session: requests.Session, path: str = COOKIE_JAR_FILE) -> bool:
     """Load previously saved cookies. Returns True if loaded."""
-    if not os.path.exists(COOKIE_JAR_FILE):
+    if not os.path.exists(path):
         return False
-    with open(COOKIE_JAR_FILE) as f:
+    with open(path) as f:
         cookies = json.load(f)
     for name, info in cookies.items():
         session.cookies.set(name, info["value"], domain=info["domain"], path=info["path"])
@@ -164,6 +164,38 @@ def check_session(session: requests.Session) -> bool:
     return False
 
 
+def get_server_time(session: requests.Session):
+    """Return MindBody's current server time as a naive local datetime (from the
+    HTTP Date header), or None. Used to align rapid-booking to the studio's clock."""
+    try:
+        r = session.head(f"{BASE_URL}/classic/mainclass", timeout=10, allow_redirects=False)
+        d = r.headers.get("Date")
+        if d:
+            from email.utils import parsedate_to_datetime
+            # parsedate gives tz-aware UTC; convert to local zone, drop tzinfo to match
+            # the naive (container-local) datetimes used elsewhere.
+            return parsedate_to_datetime(d).astimezone().replace(tzinfo=None)
+    except Exception as e:
+        print(f"[server-time] lookup failed: {e}")
+    return None
+
+
+def get_client_id(session: requests.Session) -> str | None:
+    """Return the logged-in member's clientId (MindBody member ID), or None.
+    Scraped from main_info.asp (hidden #thisClientID, falling back to the userId JS
+    var). It's account-stable, so callers should cache it rather than fetch per book."""
+    try:
+        resp = session.get(f"{BASE_URL}/ASP/main_info.asp?studioid=836167", timeout=15)
+        m = re.search(r'id="thisClientID"\s+value="(\d+)"', resp.text)
+        if not m:
+            m = re.search(r"var userId = '(\d+)'", resp.text)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        print(f"[client-id] lookup failed: {e}")
+    return None
+
+
 def get_user_name(session: requests.Session) -> str | None:
     """Return the signed-in member's display name, or None if not logged in.
 
@@ -203,7 +235,11 @@ def get_credentials() -> tuple[str, str]:
     return email, password
 
 
-def get_session() -> requests.Session:
+def get_session(email: str = None, password: str = None, cookie_jar_file: str = None) -> requests.Session:
+    """Build an authenticated session for a specific account. If creds/jar aren't
+    given, falls back to env credentials and the default cookie jar."""
+    if cookie_jar_file is None:
+        cookie_jar_file = COOKIE_JAR_FILE
     print("[get_session] Creating new session...")
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -217,7 +253,7 @@ def get_session() -> requests.Session:
 
     # Try 1: Load saved cookie jar from last successful session
     print("[get_session] Try 1: Loading saved cookie jar...")
-    jar_loaded = load_cookie_jar(session)
+    jar_loaded = load_cookie_jar(session, cookie_jar_file)
     print(f"[get_session] Cookie jar loaded: {jar_loaded}, cookies: {len(session.cookies)}")
     if jar_loaded and check_session(session):
         print("[get_session] Restored session from saved cookies.")
@@ -226,7 +262,8 @@ def get_session() -> requests.Session:
     # Try 2: Log in with playwright (bypasses Cloudflare)
     print("[get_session] Try 2: Logging in with playwright...")
     session.cookies.clear()
-    email, password = get_credentials()
+    if email is None or password is None:
+        email, password = get_credentials()
     print(f"[get_session] Credentials loaded for: {email}")
     cookies = login_with_playwright(email, password)
     print(f"[get_session] Got {len(cookies)} cookies from browser")
@@ -235,7 +272,7 @@ def get_session() -> requests.Session:
     apply_cookies(session, cookies)
 
     # Save for next time
-    with open(COOKIE_JAR_FILE, "w") as f:
+    with open(cookie_jar_file, "w") as f:
         json.dump(cookies, f)
     print("[get_session] Cookie jar saved")
 
@@ -244,6 +281,32 @@ def get_session() -> requests.Session:
         return session
 
     raise RuntimeError("Login succeeded in browser but session check failed.")
+
+
+class RateLimited(Exception):
+    """Raised when MindBody/Cloudflare returns a throttle or bot-challenge response
+    instead of the page we asked for. Callers should back off rather than retry hard."""
+    def __init__(self, status, detail=""):
+        self.status = status
+        super().__init__(f"rate-limited/challenge (HTTP {status}){(' ' + detail) if detail else ''}")
+
+
+_CHALLENGE_MARKERS = (
+    "just a moment", "cf-browser-verification", "/cdn-cgi/challenge-platform",
+    "attention required", "cf-challenge", "ddos protection by",
+)
+
+
+def _is_throttled(resp) -> bool:
+    """True if the response is a throttle (429/503) or a Cloudflare challenge page.
+    A challenge often comes back as 403, or even 200 with a JS-challenge body."""
+    if resp.status_code in (403, 429, 503):
+        return True
+    if "text/html" in resp.headers.get("Content-Type", "").lower():
+        low = resp.text[:4000].lower()
+        if any(m in low for m in _CHALLENGE_MARKERS):
+            return True
+    return False
 
 
 def get_classes(
@@ -279,6 +342,8 @@ def get_classes(
     }
 
     resp = session.post(url, params=params, data=form_data, timeout=30)
+    if _is_throttled(resp):
+        raise RateLimited(resp.status_code)
     resp.raise_for_status()
     return parse_classes(resp.text)
 
@@ -329,18 +394,30 @@ def parse_classes(html: str) -> list[dict]:
         # Extract time from first col
         time = cols[0].get_text(strip=True)
 
-        # Extract signup button and class_id/class_date from onClick
+        # Extract the booking link params from the signup button onClick, e.g.
+        #   document.location='/ASP/res_a.asp?tg=28&classId=7684&classDate=6/9/2026&clsLoc=1'
+        # tg and clsLoc vary per class, so we must read them (not hardcode).
         class_id = None
         class_date = current_date_str  # default from day header
+        tg = None
+        cls_loc = None
         has_signup = False
         btn = element.find("input", class_="SignupButton")
         if btn:
             has_signup = True
             onclick = btn.get("onclick", "")
-            m = re.search(r"classId=(\d+)&classDate=([^&']+)", onclick)
+            m = re.search(r"classId=(\d+)", onclick)
             if m:
                 class_id = m.group(1)
-                class_date = m.group(2)
+            md = re.search(r"classDate=([^&'\"]+)", onclick)
+            if md:
+                class_date = md.group(1)
+            mt = re.search(r"tg=(\d+)", onclick)
+            if mt:
+                tg = mt.group(1)
+            ml = re.search(r"clsLoc=(\d+)", onclick)
+            if ml:
+                cls_loc = ml.group(1)
 
         # Extract availability from the text like "(6 Reserved, 0 Open)"
         avail_text = ""
@@ -388,45 +465,25 @@ def parse_classes(html: str) -> list[dict]:
             "has_signup": has_signup,
             "class_id": class_id,
             "class_date": class_date,
+            "tg": tg,
+            "cls_loc": cls_loc,
         })
 
     return classes
 
 
-def signup_for_class(session: requests.Session, class_id: str, class_date: str, tg: str = "28", cls_loc: str = "1") -> str:
+def signup_for_class(session: requests.Session, class_id: str, class_date: str, tg: str = "28", cls_loc: str = "1", client_id: str = "") -> str:
     """
-    Book a class through the 3-step MindBody flow:
-      1. res_a.asp    — reservation page (sets session state)
-      2. res_deb.asp  — debit/confirm (actually books it)
-      3. my_sch.asp   — confirmation page
+    Book a class through the MindBody flow:
+      1. res_deb.asp  — debit/confirm (actually books it)
+      2. my_sch.asp   — confirmation page (only if res_deb redirects)
+
+    We intentionally skip res_a.asp (the reservation page). Testing confirmed
+    res_deb commits the booking without it, which roughly halves the commit latency.
+    clientId is supplied by the caller (cached via get_client_id) since res_a was
+    its old source.
     """
-    # Step 1: Hit the reservation page
-    print(f"[book] Step 1: GET res_a.asp classId={class_id} classDate={class_date} tg={tg} clsLoc={cls_loc}")
-    res_a_url = f"{BASE_URL}/ASP/res_a.asp"
-    res_a_params = {"tg": tg, "classId": class_id, "classDate": class_date, "clsLoc": cls_loc}
-    resp = session.get(res_a_url, params=res_a_params, timeout=30)
-    print(f"[book] Step 1 response: status={resp.status_code} length={len(resp.text)} url={resp.url}")
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    page_text = soup.get_text()
-
-    # Check if class is full
-    if "class is full" in page_text.lower():
-        print(f"[book] Class is full!")
-        return f"Class {class_id} on {class_date} is FULL."
-
-    # Check for session issues — if we got redirected to the login page (su1.asp)
-    if "/su1.asp" in resp.url:
-        print(f"[book] Session expired — redirected to login: {resp.url}")
-        return f"Session expired. Please refresh and try again."
-
-    # Step 2: Hit res_deb.asp to confirm the booking
-    client_id = ""
-    client_match = re.search(r"clientId=(\d+)", resp.text)
-    if client_match:
-        client_id = client_match.group(1)
-    print(f"[book] Extracted clientId={client_id}")
+    print(f"[book] Booking class {class_id} on {class_date} (tg={tg} clsLoc={cls_loc}) clientId={client_id!r}")
 
     res_deb_url = f"{BASE_URL}/ASP/res_deb.asp"
     res_deb_params = {
@@ -442,18 +499,23 @@ def signup_for_class(session: requests.Session, class_id: str, class_date: str, 
         "clientId": client_id,
         "enroll": "false",
     }
-    print(f"[book] Step 2: GET res_deb.asp params={res_deb_params}")
+    print(f"[book] Step 1: GET res_deb.asp params={res_deb_params}")
     resp2 = session.get(res_deb_url, params=res_deb_params, timeout=30)
-    print(f"[book] Step 2 response: status={resp2.status_code} length={len(resp2.text)} url={resp2.url}")
+    print(f"[book] Step 1 response: status={resp2.status_code} length={len(resp2.text)} url={resp2.url}")
     resp2.raise_for_status()
+
+    # Session expired → redirected to login (res_a used to catch this; now res_deb does).
+    if "/su1.asp" in resp2.url:
+        print(f"[book] Session expired — redirected to login: {resp2.url}")
+        return f"Session expired. Please refresh and try again."
 
     soup2 = BeautifulSoup(resp2.text, "html.parser")
     page_text2 = soup2.get_text()
 
-    # Step 3: Check for confirmation
+    # Check for confirmation
     has_booked = "you've booked" in page_text2.lower()
     has_notify = "notifyBooking" in resp2.text
-    print(f"[book] Step 3: has_booked={has_booked} has_notify={has_notify}")
+    print(f"[book] Step 2 check: has_booked={has_booked} has_notify={has_notify}")
 
     if has_booked or has_notify:
         print(f"[book] SUCCESS! Booked class {class_id}")

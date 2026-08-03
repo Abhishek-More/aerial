@@ -1,0 +1,16 @@
+# Always-on account-deactivation monitor.
+#   docker compose -f monitor/docker-compose.yml up -d --build
+# Run from the aerial repo root so the build context can see api/bot.py.
+services:
+  monitor:
+    build:
+      context: ..
+      dockerfile: monitor/Dockerfile
+    restart: always          # runs constantly; comes back on crash/reboot
+    env_file:
+      - .env                 # MB1_*/MB2_* accounts, SLACK_WEBHOOK_URL, etc.
+    volumes:
+      - monitor-data:/data   # persists last-known account status across restarts
+
+volumes:
+  monitor-data:

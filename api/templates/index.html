@@ -101,6 +101,36 @@
       .dot-done { background: #4ade80; }
       @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
+      /* Debug */
+      .debug-section { border: 1px solid #1a1a2e; border-radius: 8px; margin-bottom: 12px; background: #0f0f1a; }
+      .debug-section > summary {
+        display: flex; align-items: center; gap: 8px; cursor: pointer; list-style: none;
+        padding: 12px 14px; font-size: 0.85rem; font-weight: 600; color: #ccc; user-select: none;
+      }
+      .debug-section > summary::-webkit-details-marker { display: none; }
+      .debug-section > summary::before { content: '▸'; color: #6366f1; font-size: 0.7rem; transition: transform 0.15s; }
+      .debug-section[open] > summary::before { transform: rotate(90deg); }
+      .debug-section > div { padding: 0 14px 14px; }
+      .job-row {
+        display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: baseline;
+        padding: 10px 0; border-top: 1px solid #1a1a2e; font-size: 0.82rem;
+      }
+      .job-id { color: #e5e7eb; font-family: 'SF Mono', 'Fira Code', monospace; }
+      .job-next { color: #a5b4fc; font-variant-numeric: tabular-nums; white-space: nowrap; }
+      .job-next.paused { color: #f87171; }
+      .job-trigger { grid-column: 1 / -1; color: #64748b; font-size: 0.72rem; font-family: 'SF Mono', monospace; }
+      .debug-meta { color: #64748b; font-size: 0.75rem; padding: 4px 0 8px; }
+      .fc-row {
+        display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; align-items: baseline;
+        padding: 10px 0; border-top: 1px solid #1a1a2e; font-size: 0.82rem;
+      }
+      .fc-name { color: #e5e7eb; }
+      .fc-meta { grid-column: 1 / -1; color: #64748b; font-size: 0.72rem; }
+      .fc-badge { padding: 2px 9px; border-radius: 12px; font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
+      .fc-open { background: #052e16; color: #4ade80; }
+      .fc-full { background: #2a2030; color: #c084fc; }
+      .fc-other { background: #422006; color: #fbbf24; }
+
       .loading { text-align: center; padding: 40px; color: #666; }
       .boot-log {
         text-align: left; padding: 20px 24px; color: #555; font-family: 'SF Mono', 'Fira Code', monospace;
@@ -145,15 +175,15 @@
   <body>
     <div class="container">
       <h1>Aerial
-        <span id="authIcon" title="checking session..." style="vertical-align:middle;margin-left:8px;"></span>
-        <span id="authUser" style="font-size:13px;font-weight:normal;color:#888;margin-left:6px;vertical-align:middle;"></span>
-        <button class="btn-nav" id="reauthBtn" onclick="requestReauth()" title="Refresh login session"
-                style="float:right;font-size:12px;">Re-auth</button>
+        <span id="authIcon" onclick="requestReauth()" title="checking session..." style="vertical-align:middle;margin-left:8px;cursor:pointer;"></span>
+        <select id="accountSelect" onchange="switchAccount(this.value)" title="Switch account"
+                style="float:right;margin-left:8px;font-size:12px;background:#1e1e2e;color:#ccc;border:1px solid #333;border-radius:6px;padding:5px 6px;"></select>
       </h1>
 
       <div class="tabs">
         <div class="tab active" data-tab="classes">Classes</div>
-        <div class="tab" data-tab="watchlist">Watchlist <span id="watchCount"></span></div>
+        <div class="tab" data-tab="watchlist">Your Classes <span id="watchCount"></span></div>
+        <div class="tab" data-tab="debug">Debug</div>
       </div>
 
       <div id="classes" class="tab-content active">
@@ -182,6 +212,26 @@
         <div id="watchlistContent"><div class="loading">Loading...</div></div>
       </div>
 
+      <div id="debug" class="tab-content">
+        <details class="debug-section" open>
+          <summary>
+            Scheduled Jobs
+            <button class="btn-nav" style="margin-left:auto;font-size:0.75rem;padding:4px 10px;"
+                    onclick="event.preventDefault();fetchDebugJobs();">Refresh</button>
+          </summary>
+          <div id="debugJobsContent"><div class="loading">Loading...</div></div>
+        </details>
+
+        <details class="debug-section">
+          <summary>
+            Last Full-Watch Check
+            <button class="btn-nav" style="margin-left:auto;font-size:0.75rem;padding:4px 10px;"
+                    onclick="event.preventDefault();fetchFullCheck();">Refresh</button>
+          </summary>
+          <div id="debugFullCheckContent"><div class="loading">Loading...</div></div>
+        </details>
+      </div>
+
     </div>
 
     <div class="toast" id="toast"></div>
@@ -195,8 +245,101 @@
           tab.classList.add('active');
           document.getElementById(tab.dataset.tab).classList.add('active');
           if (tab.dataset.tab === 'watchlist') fetchWatchlist();
+          if (tab.dataset.tab === 'debug') { fetchDebugJobs(); fetchFullCheck(); }
+          else stopDebugTimers();
         });
       });
+
+      // --- Debug ---
+      let _debugTick = null;      // 1s ticker that updates the countdowns live
+      let _debugRefresh = null;   // periodic re-fetch so next_run updates after a job fires
+
+      function tickDebugJobs() {
+        // Recompute each countdown from its absolute next-run time every second.
+        document.querySelectorAll('#debugJobsContent [data-job-next]').forEach(el => {
+          const diff = (new Date(el.dataset.jobNext) - new Date()) / 1000;
+          el.textContent = formatCountdown(diff);
+          // Once a run is due, refetch shortly to pick up the rescheduled next_run.
+          if (diff <= 0 && !el.dataset.due) { el.dataset.due = '1'; setTimeout(fetchDebugJobs, 1500); }
+        });
+      }
+
+      function startDebugTimers() {
+        if (_debugTick) clearInterval(_debugTick);
+        if (_debugRefresh) clearInterval(_debugRefresh);
+        _debugTick = setInterval(tickDebugJobs, 1000);
+        _debugRefresh = setInterval(() => { fetchDebugJobs(); fetchFullCheck(); }, 15000);
+      }
+
+      function stopDebugTimers() {
+        if (_debugTick) { clearInterval(_debugTick); _debugTick = null; }
+        if (_debugRefresh) { clearInterval(_debugRefresh); _debugRefresh = null; }
+      }
+
+      async function fetchDebugJobs() {
+        const el = document.getElementById('debugJobsContent');
+        try {
+          const res = await fetch('/api/debug/jobs');
+          const data = await res.json();
+          if (!data.jobs.length) {
+            el.innerHTML = '<div class="empty">No scheduled jobs.</div>';
+            return;
+          }
+          let html = `<div class="debug-meta">scheduler ${data.running ? 'running' : 'STOPPED'} · ${data.count} jobs · server time ${new Date(data.now).toLocaleTimeString()}</div>`;
+          html += data.jobs.map(j => {
+            const when = j.paused
+              ? '<span class="job-next paused">paused</span>'
+              : `<span class="job-next"><span data-job-next="${j.next_run}">${formatCountdown(j.seconds_until)}</span> · ${new Date(j.next_run).toLocaleString()}</span>`;
+            return `<div class="job-row">
+              <span class="job-id">${j.id}</span>
+              ${when}
+              <span class="job-trigger">${j.trigger}</span>
+            </div>`;
+          }).join('');
+          el.innerHTML = html;
+          startDebugTimers();
+        } catch (e) {
+          el.innerHTML = '<div class="empty">Failed to load jobs.</div>';
+        }
+      }
+
+      async function fetchFullCheck() {
+        const el = document.getElementById('debugFullCheckContent');
+        try {
+          const res = await fetch('/api/debug/full-check');
+          const d = await res.json();
+          if (!d.ran_at) {
+            el.innerHTML = '<div class="empty">Has not run yet since startup.</div>';
+            return;
+          }
+          const s = d.summary;
+          const when = new Date(d.ran_at);
+          const ago = Math.max(0, Math.round((new Date() - when) / 1000));
+          let html = `<div class="debug-meta">ran ${formatCountdown(ago)} ago (${when.toLocaleTimeString()}) · ${d.duration_ms}ms · `
+            + `${s.total} searched — <span style="color:#4ade80;">${s.open} open</span>, `
+            + `<span style="color:#c084fc;">${s.full} full</span>`
+            + (s.other ? `, <span style="color:#fbbf24;">${s.other} other</span>` : '')
+            + (d.note ? ` · ${d.note}` : '') + '</div>';
+          if (!d.items.length) {
+            html += '<div class="empty">No notify-mode watches to check.</div>';
+          } else {
+            html += d.items.map(i => {
+              let cls = 'fc-other', label = i.status;
+              if (i.status === 'open') { cls = 'fc-open'; label = `OPEN · ${i.open} spot${i.open === 1 ? '' : 's'}`; }
+              else if (i.status === 'full') { cls = 'fc-full'; label = 'FULL'; }
+              else { label = i.status.replace('_', ' ').toUpperCase(); }
+              return `<div class="fc-row">
+                <span class="fc-name">${i.name}</span>
+                <span class="fc-badge ${cls}">${label}</span>
+                <span class="fc-meta">${i.date} · ${i.time}</span>
+              </div>`;
+            }).join('');
+          }
+          el.innerHTML = html;
+        } catch (e) {
+          el.innerHTML = '<div class="empty">Failed to load.</div>';
+        }
+      }
 
       // --- Toast ---
       function showToast(msg) {
@@ -252,29 +395,68 @@
       const LOCK_CLOSED = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
       const LOCK_OPEN = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>';
 
+      async function loadAccounts() {
+        try {
+          const r = await fetch('/api/accounts');
+          const d = await r.json();
+          const sel = document.getElementById('accountSelect');
+          if (!d.accounts || d.accounts.length <= 1) { sel.style.display = 'none'; return; }
+          sel.style.display = '';
+          sel.innerHTML = d.accounts.map(a =>
+            `<option value="${a.id}" ${a.active ? 'selected' : ''}>${a.name}</option>`).join('');
+        } catch (e) {}
+      }
+
+      async function switchAccount(id) {
+        const sel = document.getElementById('accountSelect');
+        sel.disabled = true;
+        try {
+          const r = await fetch('/api/switch-account', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ id }),
+          });
+          const d = await r.json();
+          showToast(d.name ? `Switched to ${d.name}` : 'Switched account');
+          await Promise.all([refreshAuthDot(), loadAccounts()]);
+          fetchClasses(); fetchWatchlist();
+        } catch (e) {
+          showToast('Failed to switch account');
+        } finally {
+          sel.disabled = false;
+        }
+      }
+
       async function refreshAuthDot() {
         const icon = document.getElementById('authIcon');
         try {
           const r = await fetch('/api/auth-status');
           const d = await r.json();
           icon.innerHTML = d.authenticated ? LOCK_CLOSED : LOCK_OPEN;
-          icon.title = d.authenticated ? 'Authenticated (idsrvauth present)' : 'Not authenticated — tap Re-auth';
-          document.getElementById('authUser').textContent = (d.authenticated && d.user) ? d.user : '';
+          icon.title = d.authenticated ? 'Authenticated (idsrvauth present) — tap to re-auth' : 'Not authenticated — tap to re-auth';
         } catch (e) {
           icon.title = 'Auth status unknown';
         }
       }
 
+      let _reauthing = false;
       async function requestReauth() {
-        const btn = document.getElementById('reauthBtn');
-        btn.disabled = true;
+        if (_reauthing) return;  // ignore rapid double-taps on the lock icon
+        _reauthing = true;
+        const icon = document.getElementById('authIcon');
+        icon.style.opacity = '0.4';
+        icon.style.cursor = 'wait';
         try {
           await fetch('/api/request-reauth', { method: 'POST' });
-          showToast('Re-auth requested — reload in a moment to see status.');
+          showToast('Re-auth requested — status will update shortly.');
         } catch (e) {
           showToast('Failed to request re-auth');
         } finally {
-          setTimeout(() => { btn.disabled = false; }, 3000);
+          setTimeout(() => {
+            _reauthing = false;
+            icon.style.opacity = '1';
+            icon.style.cursor = 'pointer';
+            refreshAuthDot();
+          }, 3000);
         }
       }
 
@@ -318,7 +500,7 @@
           } else if (cls.watched) {
             actionBtn = `<button class="btn-unwatch btn-small" onclick="unwatchClass(${clsJson})">Watching</button>`;
           } else if (cls.has_signup && cls.class_id && cls.open > 0) {
-            actionBtn = `<button class="btn-book btn-small" onclick="bookClass('${cls.class_id}','${cls.class_date}')">Book</button>`;
+            actionBtn = `<button class="btn-book btn-small" onclick="bookClass(${clsJson})">Book</button>`;
           } else if (cls.has_signup && cls.class_id && cls.open === 0) {
             // Full — offer to watch for an opening and email when a spot frees up.
             actionBtn = `<button class="btn-watch btn-small" onclick="watchClass(${clsJson}, 'notify')">Notify</button>`;
@@ -343,13 +525,14 @@
         el.innerHTML = html;
       }
 
-      async function bookClass(classId, classDate) {
+      async function bookClass(cls) {
         if (!confirm('Book this class now?')) return;
         showToast('Booking...');
         try {
           const res = await fetch('/api/book', {
             method: 'POST', headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({class_id: classId, class_date: classDate}),
+            body: JSON.stringify({class_id: cls.class_id, class_date: cls.class_date,
+                                  tg: cls.tg, cls_loc: cls.cls_loc}),
           });
           const data = await res.json();
           showToast(data.result || data.error || 'Done');
@@ -424,6 +607,72 @@
         }, 1000);
       }
 
+      // Latest class first; entries without a parseable datetime sink to the bottom.
+      function byTimeDesc(a, b) {
+        const ta = a.class_dt ? new Date(a.class_dt).getTime() : -Infinity;
+        const tb = b.class_dt ? new Date(b.class_dt).getTime() : -Infinity;
+        return tb - ta;
+      }
+
+      function watchRowHtml(w) {
+        // Phase indicator
+        const phase = w.phase || 'unknown';
+        let dotClass = 'dot-scheduled';
+
+        if (phase === 'done' || w.status === 'booked' || w.status === 'snagged') {
+          dotClass = 'dot-done';
+        } else if (phase === 'booking') {
+          dotClass = 'dot-booking';
+        } else if (phase === 'reauth') {
+          dotClass = 'dot-reauth';
+        }
+
+        // Notify-mode watches (full classes) show a status instead of a countdown.
+        if (w.mode === 'notify') {
+          if (w.status === 'booked' || w.status === 'opened') dotClass = 'dot-done';
+          else if (w.status === 'book_failed' || w.status === 'expired') dotClass = 'dot-reauth';
+          else dotClass = 'dot-scheduled';
+        }
+
+        let opensHtml = '?';
+        if (w.mode === 'notify') {
+          if (w.status === 'booked') opensHtml = 'Booked ✓';
+          else if (w.status === 'book_failed') opensHtml = 'Book failed';
+          else if (w.status === 'opened') opensHtml = `Open — ${w.emailed ? 'emailed' : 'email failed'}`;
+          else if (w.status === 'expired') opensHtml = 'Class passed';
+          else opensHtml = 'Watching for opening';
+        } else if (w.status === 'booked' || w.status === 'snagged') {
+          opensHtml = 'Booked ✓';
+        } else if (w.status === 'expired') {
+          opensHtml = 'Class passed';
+        } else if (w.open_time) {
+          const diff = (new Date(w.open_time) - new Date()) / 1000;
+          opensHtml = `<span data-open-time="${w.open_time}">${formatCountdown(diff)}</span>`;
+        }
+
+        const rm = w.status !== 'booked' && w.status !== 'snagged'
+          ? `<button class="btn-unwatch btn-small" onclick="unwatchByEntry(${JSON.stringify(w).replace(/"/g,'&quot;')})">Remove</button>` : '';
+
+        return `
+          <div class="watchlist-item">
+            <div>
+              <strong>${w.class_name}</strong><br>
+              <span style="color:#888;font-size:0.75rem;">${w.teacher||''} · ${w.time || ''}</span>
+              <span class="wl-mobile-meta"><span class="phase-dot ${dotClass}"></span>${w.date_label || w.class_date || ''} · ${w.mode === 'notify' ? opensHtml : 'opens ' + opensHtml}</span>
+            </div>
+            <div class="wl-date">${w.date_label || w.class_date || ''}</div>
+            <div class="wl-time"><span class="phase-dot ${dotClass}"></span>${opensHtml}</div>
+            <div style="text-align:right;">${rm}</div>
+          </div>`;
+      }
+
+      function watchTableHtml(list) {
+        const header = `<div class="watchlist-item" style="color:#555; font-size:0.75rem; font-weight:600; border-bottom:1px solid #333;">
+          <div>Class</div><div class="wl-header-date">Date</div><div class="wl-header-time">Opens</div><div></div>
+        </div>`;
+        return header + list.map(watchRowHtml).join('');
+      }
+
       function renderWatchlist(list) {
         const el = document.getElementById('watchlistContent');
         if (!list.length) {
@@ -431,66 +680,20 @@
           return;
         }
 
-        let html = `<div class="watchlist-item" style="color:#555; font-size:0.75rem; font-weight:600; border-bottom:1px solid #333;">
-          <div>Class</div><div class="wl-header-date">Date</div><div class="wl-header-time">Opens</div><div></div>
-        </div>`;
+        const ARCHIVED = ['booked', 'snagged', 'expired'];
+        const active = list.filter(w => !ARCHIVED.includes(w.status)).sort(byTimeDesc);
+        const archived = list.filter(w => ARCHIVED.includes(w.status)).sort(byTimeDesc);
 
-        for (const w of list) {
-          // Phase indicator
-          const phase = w.phase || 'unknown';
-          let dotClass = 'dot-scheduled';
-          let phaseLabel = 'Scheduled';
-          let statusClass = 'status-waiting';
+        let html = active.length
+          ? watchTableHtml(active)
+          : '<div class="empty" style="padding:20px;">No upcoming classes — see Booked &amp; expired below.</div>';
 
-          if (phase === 'done' || w.status === 'booked' || w.status === 'snagged') {
-            dotClass = 'dot-done'; phaseLabel = 'Booked'; statusClass = 'status-booked';
-          } else if (phase === 'booking') {
-            dotClass = 'dot-booking'; phaseLabel = 'Booking...'; statusClass = 'status-booking';
-          } else if (phase === 'reauth') {
-            dotClass = 'dot-reauth'; phaseLabel = 'Re-auth'; statusClass = 'status-reauth';
-          }
-
-          // Notify-mode watches (full classes) show a status instead of a countdown.
-          if (w.mode === 'notify') {
-            if (w.status === 'booked') {
-              dotClass = 'dot-done'; phaseLabel = 'Booked';
-            } else if (w.status === 'book_failed') {
-              dotClass = 'dot-reauth'; phaseLabel = 'Book failed';
-            } else if (w.status === 'opened') {
-              dotClass = 'dot-done'; phaseLabel = 'Opened';
-            } else if (w.status === 'expired') {
-              dotClass = 'dot-reauth'; phaseLabel = 'Expired';
-            } else {
-              dotClass = 'dot-scheduled'; phaseLabel = 'Watching';
-            }
-          }
-
-          let opensHtml = '?';
-          if (w.mode === 'notify') {
-            if (w.status === 'booked') opensHtml = 'Booked ✓';
-            else if (w.status === 'book_failed') opensHtml = 'Book failed';
-            else if (w.status === 'opened') opensHtml = `Open — ${w.emailed ? 'emailed' : 'email failed'}`;
-            else if (w.status === 'expired') opensHtml = 'Class passed';
-            else opensHtml = 'Watching for opening';
-          } else if (w.open_time) {
-            const diff = (new Date(w.open_time) - new Date()) / 1000;
-            opensHtml = `<span data-open-time="${w.open_time}">${formatCountdown(diff)}</span>`;
-          }
-
-          const rm = w.status !== 'booked' && w.status !== 'snagged'
-            ? `<button class="btn-unwatch btn-small" onclick="unwatchByEntry(${JSON.stringify(w).replace(/"/g,'&quot;')})">Remove</button>` : '';
-
+        if (archived.length) {
           html += `
-            <div class="watchlist-item">
-              <div>
-                <strong>${w.class_name}</strong><br>
-                <span style="color:#888;font-size:0.75rem;">${w.teacher||''} · ${w.time || ''}</span>
-                <span class="wl-mobile-meta"><span class="phase-dot ${dotClass}"></span>${w.date_label || w.class_date || ''} · ${w.mode === 'notify' ? opensHtml : 'opens ' + opensHtml}</span>
-              </div>
-              <div class="wl-date">${w.date_label || w.class_date || ''}</div>
-              <div class="wl-time"><span class="phase-dot ${dotClass}"></span>${opensHtml}</div>
-              <div style="text-align:right;">${rm}</div>
-            </div>`;
+            <details class="debug-section" style="margin-top:14px;">
+              <summary>Booked &amp; expired (${archived.length})</summary>
+              <div>${watchTableHtml(archived)}</div>
+            </details>`;
         }
         el.innerHTML = html;
       }
@@ -508,6 +711,7 @@
       // --- Init: stream boot logs, then fetch classes ---
       (function boot() {
         refreshAuthDot();
+        loadAccounts();
         const el = document.getElementById('classList');
         el.innerHTML = '<div class="boot-log" id="bootLog"></div>';
         const logEl = document.getElementById('bootLog');

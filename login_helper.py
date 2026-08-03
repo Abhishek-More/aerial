@@ -29,15 +29,14 @@ from pathlib import Path
 
 STUDIO_URL = "https://clients.mindbodyonline.com/classic/ws?studioid=836167"
 MEMBER_URL = "https://clients.mindbodyonline.com/ASP/main_info.asp?studioid=836167"
-UPLOAD_URL = os.environ.get("UPLOAD_URL", "http://localhost:5050/api/upload-cookies")
-PROFILE_DIR = os.environ.get("AERIAL_PROFILE_DIR", os.path.expanduser("~/.aerial-chrome-profile"))
+APP_BASE = os.environ.get("APP_BASE", "http://localhost:5050")
 HEADLESS = os.environ.get("AERIAL_HEADLESS") == "1"
 AUTO = "--auto" in sys.argv
 
 # Generous human window when interactive; short unattended window when --auto.
 LOGIN_TIMEOUT = 45 if AUTO else 300
 
-# Pull credentials from api/.env to prefill / auto-submit the form.
+# Pull credentials from api/.env (MB1_*, MB2_, ... or legacy MB_*).
 ENV = {}
 env_path = Path(__file__).parent / "api" / ".env"
 if env_path.exists():
@@ -46,8 +45,37 @@ if env_path.exists():
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
             ENV[k.strip()] = v.strip().strip('"').strip("'")
-EMAIL = ENV.get("MB_EMAIL", "")
-PASSWORD = ENV.get("MB_PASSWORD", "")
+
+# Build {email: password} across all configured accounts.
+ACCOUNTS_BY_EMAIL = {}
+for i in range(1, 6):
+    e, p = ENV.get(f"MB{i}_EMAIL"), ENV.get(f"MB{i}_PASSWORD")
+    if e and p:
+        ACCOUNTS_BY_EMAIL[e] = p
+if ENV.get("MB_EMAIL") and ENV.get("MB_PASSWORD"):
+    ACCOUNTS_BY_EMAIL.setdefault(ENV["MB_EMAIL"], ENV["MB_PASSWORD"])
+
+import json
+import urllib.request
+
+
+def _active_account():
+    """Ask the running app which account is active. Falls back to the first .env account."""
+    try:
+        with urllib.request.urlopen(f"{APP_BASE}/api/active-account", timeout=10) as r:
+            d = json.load(r)
+            return d.get("id", "1"), d.get("email", "")
+    except Exception as e:
+        print(f"[helper] Could not reach app for active account ({e}); using first .env account.")
+        first = next(iter(ACCOUNTS_BY_EMAIL), "")
+        return "1", first
+
+
+ACCOUNT_ID, EMAIL = _active_account()
+PASSWORD = ACCOUNTS_BY_EMAIL.get(EMAIL, "")
+PROFILE_DIR = os.environ.get("AERIAL_PROFILE_DIR",
+                             os.path.expanduser(f"~/.aerial-chrome-profile-{ACCOUNT_ID}"))
+UPLOAD_URL = os.environ.get("UPLOAD_URL", f"{APP_BASE}/api/upload-cookies") + f"?account={ACCOUNT_ID}"
 
 from playwright.sync_api import sync_playwright
 

@@ -5,8 +5,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget gnupg ca-certificates fonts-liberation libasound2 libatk-bridge2.0-0 \
     libatk1.0-0 libcups2 libdbus-1-3 libdrm2 libgbm1 libgtk-3-0 libnspr4 \
     libnss3 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 xdg-utils \
-    libpango-1.0-0 libcairo2 libxshmfence1 && \
+    libpango-1.0-0 libcairo2 libxshmfence1 tzdata && \
     rm -rf /var/lib/apt/lists/*
+
+# Class times are US Eastern (e.g. "7:45 pm EDT"); run the container in that zone
+# so datetime.now() comparisons against class times are correct (DST handled).
+ENV TZ=America/New_York
 
 WORKDIR /app
 
