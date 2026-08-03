@@ -759,7 +759,9 @@ def rapid_book(watch: dict):
         f"Missed at open, now watching: {class_name} — {_class_when(book_info)}",
         f"Couldn't grab {class_name} the moment signup opened ({reason}).\n\n"
         f"It's now on your watchlist in notify mode — I'll keep checking for openings and "
-        f"auto-book if a spot frees while it's 24h+ out (or email you if it opens within 24h).\n"
+        f"auto-book if a spot frees while it's 24h+ out (or email you if it opens within 24h).\n",
+        text=f"Missed {class_name} at signup open, {_short_when(book_info)}. "
+             f"Still watching for an opening.",
     )
     bump("book_failed")
     bump("emails_sent" if emailed else "emails_failed")
@@ -818,10 +820,12 @@ def _send_imsg(text: str) -> bool:
         return False
 
 
-def _notify(subject: str, body: str) -> bool:
+def _notify(subject: str, body: str, text: str = "") -> bool:
     """Every alert this bot raises goes through here: email for the detail, an
-    iMessage for the buzz. True when at least one channel took it."""
-    texted = _send_imsg(subject)
+    iMessage for the buzz. `text` is what gets texted, because an email subject
+    line reads badly on a phone; it defaults to the subject. True when at least
+    one channel took it."""
+    texted = _send_imsg(text or subject)
     return _send_email(subject, body) or texted
 
 
@@ -883,6 +887,25 @@ def _class_when(info: dict) -> str:
     return f"{info.get('date_label') or info.get('class_date', '')} at {info.get('time', '')}"
 
 
+_TZ_TAIL = re.compile(r"\s*\b[A-Z]{2,4}T\b\s*$")           # the " EDT" on a time
+_DATE_LABEL = re.compile(r"^(\w{3})\w* (\w{3})\w* (\d{1,2}),? \d{4}$")
+
+
+def _short_when(info: dict) -> str:
+    """'Thu June 11, 2026' + '7:30\\xa0pm  EDT' -> 'Thu Jun 11 at 7:30 pm'.
+
+    A text is read at a glance, so the year and the timezone are noise, and the
+    scraped values arrive with non-breaking and doubled spaces in them. Falls
+    back to whatever it was handed if the shape surprises it.
+    """
+    label = " ".join((info.get("date_label") or info.get("class_date") or "").split())
+    m = _DATE_LABEL.match(label)
+    if m:
+        label = " ".join(m.groups())
+    when = _TZ_TAIL.sub("", " ".join((info.get("time") or "").split()))
+    return f"{label} at {when}" if label and when else label or when
+
+
 def send_open_email(watch: dict, open_spots: int) -> bool:
     """A watched class freed up but starts within 24h, so it was NOT auto-booked."""
     cls = watch.get("class_name", "class")
@@ -894,7 +917,9 @@ def send_open_email(watch: dict, open_spots: int) -> bool:
         f"When:    {_class_when(watch)}\n"
         f"Teacher: {watch.get('teacher', '')}\n"
         f"Open spots: {open_spots}\n\n"
-        f"Book it yourself: https://clients.mindbodyonline.com/classic/mainclass\n"
+        f"Book it yourself: https://clients.mindbodyonline.com/classic/mainclass\n",
+        text=f"Spot open in {cls}, {_short_when(watch)}. Starts within 24h so I did "
+             f"not book it, grab it yourself.",
     )
 
 
@@ -908,7 +933,9 @@ def send_booking_email(info: dict, result: str, success: bool, source: str) -> b
         f"Class:   {cls}\n"
         f"When:    {_class_when(info)}\n"
         f"Teacher: {info.get('teacher', '')}\n"
-        f"Result:  {result}\n"
+        f"Result:  {result}\n",
+        text=f"Booked {cls}, {_short_when(info)}." if success else
+             f"Could not book {cls}, {_short_when(info)}. {result.strip()[:90]}",
     )
 
 
