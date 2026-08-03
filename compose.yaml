@@ -1,0 +1,18 @@
+services:
+  aerial:
+    build: .
+    image: aerial
+    container_name: aerial
+    restart: unless-stopped
+    ports:
+      - "${AERIAL_PORT:-5050}:5050"
+    volumes:
+      # Cookie jars, watchlists and the booking log outlive the image.
+      - ${HOME}/.aerial-data:/data
+    # Every variable in api/.env reaches the container: MindBody logins
+    # (MB*_EMAIL / MB*_PASSWORD), SMTP creds, NOTIFY_EMAIL, and IMSG_URL for
+    # iMessage alerts. Defaults live in the code, not duplicated here.
+    env_file: api/.env
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

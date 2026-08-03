@@ -6,6 +6,7 @@ import smtplib
 import sys
 import threading
 import time as _time
+import urllib.request
 from collections import deque
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -754,7 +755,7 @@ def rapid_book(watch: dict):
     save_watchlist(watchlist)
     schedule_next_full_check(delay=5)  # start polling it soon
 
-    emailed = _send_email(
+    emailed = _notify(
         f"Missed at open, now watching: {class_name} — {_class_when(book_info)}",
         f"Couldn't grab {class_name} the moment signup opened ({reason}).\n\n"
         f"It's now on your watchlist in notify mode — I'll keep checking for openings and "
@@ -799,6 +800,30 @@ def hourly_recap():
 
 
 # --- "Notify when a full class opens up" ---
+
+def _send_imsg(text: str) -> bool:
+    """Text the line through imsg, the host's iMessage service. Unset IMSG_URL
+    means the channel is off, which is not a failure."""
+    url = _envq("IMSG_URL")
+    if not url:
+        return False
+    req = urllib.request.Request(url, data=text.encode(), method="POST")
+    req.add_header("Content-Type", "text/plain; charset=utf-8")
+    req.add_header("Title", "aerial")   # imsg prefixes the message with this
+    try:
+        urllib.request.urlopen(req, timeout=10).close()
+        return True
+    except Exception as e:
+        print(f"[imsg] Failed to send: {e}")
+        return False
+
+
+def _notify(subject: str, body: str) -> bool:
+    """Every alert this bot raises goes through here: email for the detail, an
+    iMessage for the buzz. True when at least one channel took it."""
+    texted = _send_imsg(subject)
+    return _send_email(subject, body) or texted
+
 
 def _send_email(subject: str, body: str) -> bool:
     """Send an email via SMTP to all configured recipients (NOTIFY_EMAIL may be a
@@ -861,7 +886,7 @@ def _class_when(info: dict) -> str:
 def send_open_email(watch: dict, open_spots: int) -> bool:
     """A watched class freed up but starts within 24h, so it was NOT auto-booked."""
     cls = watch.get("class_name", "class")
-    return _send_email(
+    return _notify(
         f"Spot open (not booked — within 24h): {cls} — {_class_when(watch)}",
         f"A spot just opened in a class you're watching, but it starts in under 24 hours, "
         f"so it was NOT auto-booked.\n\n"
@@ -877,7 +902,7 @@ def send_booking_email(info: dict, result: str, success: bool, source: str) -> b
     """Email a confirmation (or failure notice) for any booking the app makes."""
     cls = info.get("class_name") or info.get("name", "class")
     status = "Booked" if success else "Booking FAILED"
-    return _send_email(
+    return _notify(
         f"{status}: {cls} — {_class_when(info)}",
         f"{'A class was booked' if success else 'A booking attempt failed'} ({source}).\n\n"
         f"Class:   {cls}\n"
