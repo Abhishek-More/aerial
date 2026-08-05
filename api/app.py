@@ -926,8 +926,10 @@ def send_open_email(watch: dict, open_spots: int) -> bool:
     )
 
 
-def send_booking_email(info: dict, result: str, success: bool, source: str) -> bool:
-    """Email a confirmation (or failure notice) for any booking the app makes."""
+def send_booking_email(info: dict, result: str, success: bool, source: str,
+                       quiet: bool = False) -> bool:
+    """Email a confirmation (or failure notice) for any booking the app makes.
+    `quiet` drops the text, for a booking you are watching happen in the UI."""
     cls = info.get("class_name") or info.get("name", "class")
     status = "Booked" if success else "Booking FAILED"
     return _notify(
@@ -937,8 +939,9 @@ def send_booking_email(info: dict, result: str, success: bool, source: str) -> b
         f"When:    {_class_when(info)}\n"
         f"Teacher: {info.get('teacher', '')}\n"
         f"Result:  {result}\n",
-        text=f"You're in: {cls}, {_short_when(info)}." if success else
-             f"Couldn't get you into {cls}, {_short_when(info)}. {result.strip()[:90]}",
+        text=None if quiet else (
+            f"You're in: {cls}, {_short_when(info)}." if success else
+            f"Couldn't get you into {cls}, {_short_when(info)}. {result.strip()[:90]}"),
     )
 
 
@@ -1329,7 +1332,8 @@ def api_book():
 
         success = _booking_succeeded(result)
         info = _find_cached_class(class_id, class_date) or {"class_id": class_id, "class_date": class_date}
-        emailed = send_booking_email(info, result, success, source="manual book")
+        emailed = send_booking_email(info, result, success, source="manual book",
+                                     quiet=True)
         bump("booked" if success else "book_failed")
         bump("emails_sent" if emailed else "emails_failed")
 
