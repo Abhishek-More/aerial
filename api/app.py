@@ -760,8 +760,8 @@ def rapid_book(watch: dict):
         f"Couldn't grab {class_name} the moment signup opened ({reason}).\n\n"
         f"It's now on your watchlist in notify mode — I'll keep checking for openings and "
         f"auto-book if a spot frees while it's 24h+ out (or email you if it opens within 24h).\n",
-        text=f"Missed {class_name} at signup open, {_short_when(book_info)}. "
-             f"Still watching for an opening.",
+        text=f"{class_name} filled the second signup opened, {_short_when(book_info)}. "
+             f"Still watching in case someone drops.",
     )
     bump("book_failed")
     bump("emails_sent" if emailed else "emails_failed")
@@ -918,8 +918,8 @@ def send_open_email(watch: dict, open_spots: int) -> bool:
         f"Teacher: {watch.get('teacher', '')}\n"
         f"Open spots: {open_spots}\n\n"
         f"Book it yourself: https://clients.mindbodyonline.com/classic/mainclass\n",
-        text=f"Spot open in {cls}, {_short_when(watch)}. Starts within 24h so I did "
-             f"not book it, grab it yourself.",
+        text=f"A spot just opened in {cls}, {_short_when(watch)}. It's under 24h out so "
+             f"I didn't book it, go grab it.",
     )
 
 
@@ -934,8 +934,8 @@ def send_booking_email(info: dict, result: str, success: bool, source: str) -> b
         f"When:    {_class_when(info)}\n"
         f"Teacher: {info.get('teacher', '')}\n"
         f"Result:  {result}\n",
-        text=f"Booked {cls}, {_short_when(info)}." if success else
-             f"Could not book {cls}, {_short_when(info)}. {result.strip()[:90]}",
+        text=f"You're in: {cls}, {_short_when(info)}." if success else
+             f"Couldn't get you into {cls}, {_short_when(info)}. {result.strip()[:90]}",
     )
 
 
