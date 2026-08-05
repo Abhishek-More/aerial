@@ -755,13 +755,15 @@ def rapid_book(watch: dict):
     save_watchlist(watchlist)
     schedule_next_full_check(delay=5)  # start polling it soon
 
+    # Email only, no text: a watch that is merely still watching is not news on a
+    # phone. You asked for the watch; the text you want is the one that says a
+    # spot opened or that it got booked.
     emailed = _notify(
         f"Missed at open, now watching: {class_name} — {_class_when(book_info)}",
         f"Couldn't grab {class_name} the moment signup opened ({reason}).\n\n"
         f"It's now on your watchlist in notify mode — I'll keep checking for openings and "
         f"auto-book if a spot frees while it's 24h+ out (or email you if it opens within 24h).\n",
-        text=f"{class_name} filled the second signup opened, {_short_when(book_info)}. "
-             f"Still watching in case someone drops.",
+        text=None,
     )
     bump("book_failed")
     bump("emails_sent" if emailed else "emails_failed")
@@ -820,12 +822,13 @@ def _send_imsg(text: str) -> bool:
         return False
 
 
-def _notify(subject: str, body: str, text: str = "") -> bool:
+def _notify(subject: str, body: str, text: str | None = "") -> bool:
     """Every alert this bot raises goes through here: email for the detail, an
     iMessage for the buzz. `text` is what gets texted, because an email subject
-    line reads badly on a phone; it defaults to the subject. True when at least
-    one channel took it."""
-    texted = _send_imsg(text or subject)
+    line reads badly on a phone; it defaults to the subject, and `text=None` means
+    email only, for news that does not deserve a buzz. True when at least one
+    channel took it."""
+    texted = False if text is None else _send_imsg(text or subject)
     return _send_email(subject, body) or texted
 
 
