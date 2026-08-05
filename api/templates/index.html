@@ -502,7 +502,7 @@
           } else if (cls.has_signup && cls.class_id && cls.open > 0) {
             actionBtn = `<button class="btn-book btn-small" onclick="bookClass(${clsJson})">Book</button>`;
           } else if (cls.has_signup && cls.class_id && cls.open === 0) {
-            // Full — offer to watch for an opening and email when a spot frees up.
+            // Full — offer to watch for an opening and text when a spot frees up.
             actionBtn = `<button class="btn-watch btn-small" onclick="watchClass(${clsJson}, 'notify')">Notify</button>`;
           } else {
             actionBtn = `<button class="btn-watch btn-small" onclick="watchClass(${clsJson})">Watch</button>`;
@@ -549,7 +549,7 @@
           });
           const data = await res.json();
           const msg = data.status === 'already_watched' ? 'Already watching'
-            : (mode === 'notify' ? "Watching — auto-books if a spot opens 24h+ out, emails you either way" : 'Added to watchlist');
+            : (mode === 'notify' ? "Watching — auto-books if a spot opens 24h+ out, texts you either way" : 'Added to watchlist');
           showToast(msg);
           fetchClasses(); fetchWatchlist();
         } catch (e) { showToast('Error: ' + e.message); }
@@ -638,7 +638,7 @@
         if (w.mode === 'notify') {
           if (w.status === 'booked') opensHtml = 'Booked ✓';
           else if (w.status === 'book_failed') opensHtml = 'Book failed';
-          else if (w.status === 'opened') opensHtml = `Open — ${w.emailed ? 'emailed' : 'email failed'}`;
+          else if (w.status === 'opened') opensHtml = `Open — ${(w.texted ?? w.emailed) ? 'texted' : 'text failed'}`;
           else if (w.status === 'expired') opensHtml = 'Class passed';
           else opensHtml = 'Watching for opening';
         } else if (w.status === 'booked' || w.status === 'snagged') {

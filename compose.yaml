@@ -10,8 +10,8 @@ services:
       # Cookie jars, watchlists and the booking log outlive the image.
       - ${HOME}/.aerial-data:/data
     # Every variable in api/.env reaches the container: MindBody logins
-    # (MB*_EMAIL / MB*_PASSWORD), SMTP creds, NOTIFY_EMAIL, and IMSG_URL for
-    # iMessage alerts. Defaults live in the code, not duplicated here.
+    # (MB*_EMAIL / MB*_PASSWORD) and IMSG_URL for the iMessage alerts.
+    # Defaults live in the code, not duplicated here.
     env_file: api/.env
     logging:
       driver: json-file

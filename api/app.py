@@ -2,14 +2,12 @@ import json
 import os
 import random
 import re
-import smtplib
 import sys
 import threading
 import time as _time
 import urllib.request
 from collections import deque
 from datetime import datetime, timedelta
-from email.message import EmailMessage
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -137,7 +135,7 @@ BOOK_LEAD_TIME = timedelta(hours=24)
 # Lightweight activity counters, summarized hourly (see hourly_recap)
 _stats_lock = threading.Lock()
 STATS = {"checks": 0, "cache_refreshes": 0, "opens": 0, "booked": 0, "book_failed": 0,
-         "emails_sent": 0, "emails_failed": 0, "reauths": 0, "cookie_uploads": 0,
+         "texts_sent": 0, "texts_failed": 0, "reauths": 0, "cookie_uploads": 0,
          "auth_checks": 0, "auth_heals": 0}
 
 
@@ -602,9 +600,9 @@ def rapid_book(watch: dict):
                     w["class_id"] = state["found"]["class_id"]
                 break
         save_watchlist(watchlist)
-        emailed = send_booking_email(book_info, result, True, source="auto-book at signup-open")
+        texted = alert_booking(book_info, result, True, source="auto-book at signup-open")
         bump("booked")
-        bump("emails_sent" if emailed else "emails_failed")
+        bump("texts_sent" if texted else "texts_failed")
         append_log({
             "time": now.isoformat(), "action": "snagged", "class": class_name,
             "date": class_date, "result": result, "attempts": state["attempts"],
@@ -755,18 +753,17 @@ def rapid_book(watch: dict):
     save_watchlist(watchlist)
     schedule_next_full_check(delay=5)  # start polling it soon
 
-    # Email only, no text: a watch that is merely still watching is not news on a
-    # phone. You asked for the watch; the text you want is the one that says a
-    # spot opened or that it got booked.
-    emailed = _notify(
+    # No text: a watch that is merely still watching is not news on a phone.
+    # You asked for the watch; the text you want is the one that says a spot
+    # opened or that it got booked.
+    _notify(
         f"Missed at open, now watching: {class_name} — {_class_when(book_info)}",
         f"Couldn't grab {class_name} the moment signup opened ({reason}).\n\n"
         f"It's now on your watchlist in notify mode — I'll keep checking for openings and "
-        f"auto-book if a spot frees while it's 24h+ out (or email you if it opens within 24h).\n",
+        f"auto-book if a spot frees while it's 24h+ out (or text you if it opens within 24h).\n",
         text=None,
     )
     bump("book_failed")
-    bump("emails_sent" if emailed else "emails_failed")
     append_log({
         "time": datetime.now().isoformat(), "action": "snag_failed_now_watching",
         "class": class_name, "date": class_date, "attempts": attempts, "reason": reason,
@@ -796,7 +793,7 @@ def hourly_recap():
     print(
         f"[recap] Past hour — full-checks:{s['checks']} cache-refreshes:{s['cache_refreshes']} "
         f"spots-opened:{s['opens']} booked:{s['booked']}(failed {s['book_failed']}) "
-        f"emails:{s['emails_sent']}(failed {s['emails_failed']}) "
+        f"texts:{s['texts_sent']}(failed {s['texts_failed']}) "
         f"reauths:{s['reauths']} cookie-uploads:{s['cookie_uploads']} "
         f"auth-checks:{s['auth_checks']}(healed {s['auth_heals']}) | "
         f"active watches — notify:{notify_active} autobook:{autobook_active}"
@@ -823,47 +820,15 @@ def _send_imsg(text: str) -> bool:
 
 
 def _notify(subject: str, body: str, text: str | None = "") -> bool:
-    """Every alert this bot raises goes through here: email for the detail, an
-    iMessage for the buzz. `text` is what gets texted, because an email subject
-    line reads badly on a phone; it defaults to the subject, and `text=None` means
-    email only, for news that does not deserve a buzz. True when at least one
-    channel took it."""
-    texted = False if text is None else _send_imsg(text or subject)
-    return _send_email(subject, body) or texted
-
-
-def _send_email(subject: str, body: str) -> bool:
-    """Send an email via SMTP to all configured recipients (NOTIFY_EMAIL may be a
-    comma-separated list; falls back to MB_EMAIL, then the sender). True on success."""
-    smtp_user = _envq("SMTP_USER")
-    smtp_pass = _envq("SMTP_PASS")
-    smtp_host = _envq("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(_envq("SMTP_PORT", "587"))
-    raw = _envq("NOTIFY_EMAIL") or _envq("MB_EMAIL") or smtp_user
-    recipients = [a.strip() for a in raw.split(",") if a.strip()]
-
-    if not smtp_user or not smtp_pass:
-        print("[email] SMTP_USER/SMTP_PASS not set — cannot send email.")
+    """Every alert this bot raises goes through here: it prints the detail (so it
+    still lands in `docker logs`), and an iMessage for the buzz. `text` is what
+    gets texted, because a log-style subject line reads badly on a phone; it
+    defaults to the subject, and `text=None` means don't text, for news that
+    does not deserve a buzz. True when the text went out."""
+    print(f"[notify] {subject}\n{body}")
+    if text is None:
         return False
-    if not recipients:
-        print("[email] No recipient address available.")
-        return False
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = smtp_user
-    msg["To"] = ", ".join(recipients)
-    msg.set_content(body)
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
-            s.starttls()
-            s.login(smtp_user, smtp_pass)
-            s.send_message(msg)
-        print(f"[email] Sent '{subject}' to {', '.join(recipients)}")
-        return True
-    except Exception as e:
-        print(f"[email] Failed to send: {e}")
-        return False
+    return _send_imsg(text or subject)
 
 
 def _booking_succeeded(result: str) -> bool:
@@ -909,7 +874,7 @@ def _short_when(info: dict) -> str:
     return f"{label} at {when}" if label and when else label or when
 
 
-def send_open_email(watch: dict, open_spots: int) -> bool:
+def alert_open(watch: dict, open_spots: int) -> bool:
     """A watched class freed up but starts within 24h, so it was NOT auto-booked."""
     cls = watch.get("class_name", "class")
     return _notify(
@@ -926,9 +891,9 @@ def send_open_email(watch: dict, open_spots: int) -> bool:
     )
 
 
-def send_booking_email(info: dict, result: str, success: bool, source: str,
-                       quiet: bool = False) -> bool:
-    """Email a confirmation (or failure notice) for any booking the app makes.
+def alert_booking(info: dict, result: str, success: bool, source: str,
+                  quiet: bool = False) -> bool:
+    """Text a confirmation (or failure notice) for any booking the app makes.
     `quiet` drops the text, for a booking you are watching happen in the UI."""
     cls = info.get("class_name") or info.get("name", "class")
     status = "Booked" if success else "Booking FAILED"
@@ -973,7 +938,7 @@ def schedule_next_full_check(delay: int | None = None):
 
 
 def check_full_watches():
-    """Re-check every 'notify' watch: if a spot opened, email the user (no booking).
+    """Re-check every 'notify' watch: if a spot opened, text the user (no booking).
     Self-reschedules with a fresh random delay each run."""
     bump("checks")
     started = _time.time()
@@ -1036,7 +1001,7 @@ def check_full_watches():
 
                     far_enough = class_dt is not None and (class_dt - now) >= BOOK_LEAD_TIME
                     if far_enough and class_id:
-                        # >= 24h out → actually book it, then email the result.
+                        # >= 24h out → actually book it, then text the result.
                         tg = match.get("tg") or "28"
                         cls_loc = match.get("cls_loc") or "1"
                         print(f"[full_watch] OPEN: {w['class_name']} on {date} ({match['open']} spot) — booking (>=24h out, tg={tg} clsLoc={cls_loc}).")
@@ -1047,9 +1012,9 @@ def check_full_watches():
                             session = get_bot_session()
                             result = signup_for_class(session, class_id, match["class_date"], tg=tg, cls_loc=cls_loc, client_id=cid)
                         success = _booking_succeeded(result)
-                        emailed = send_booking_email(w, result, success, source="notify auto-book")
+                        texted = alert_booking(w, result, success, source="notify auto-book")
                         bump("booked" if success else "book_failed")
-                        bump("emails_sent" if emailed else "emails_failed")
+                        bump("texts_sent" if texted else "texts_failed")
                         w["status"] = "booked" if success else "book_failed"
                         w["result"] = result
                         w["booked_at"] = now.isoformat()
@@ -1060,16 +1025,16 @@ def check_full_watches():
                         })
                     else:
                         # < 24h out (or no class_id) → notify only, don't book.
-                        print(f"[full_watch] OPEN: {w['class_name']} on {date} ({match['open']} spot) — within 24h, emailing only.")
-                        sent = send_open_email(w, match["open"])
-                        bump("emails_sent" if sent else "emails_failed")
+                        print(f"[full_watch] OPEN: {w['class_name']} on {date} ({match['open']} spot) — within 24h, texting only.")
+                        texted = alert_open(w, match["open"])
+                        bump("texts_sent" if texted else "texts_failed")
                         w["status"] = "opened"
                         w["opened_at"] = now.isoformat()
-                        w["emailed"] = sent
+                        w["texted"] = texted
                         append_log({
                             "time": now.isoformat(), "action": "notify_open",
                             "class": w["class_name"], "date": w.get("class_date"),
-                            "open": match["open"], "emailed": sent,
+                            "open": match["open"], "texted": texted,
                         })
                 # else: still full — checked silently
         if changed:
@@ -1233,7 +1198,7 @@ def api_watch():
     data = request.json
     watchlist = load_watchlist()
 
-    # mode: "autobook" (snag when signup opens) or "notify" (email when a full class frees up)
+    # mode: "autobook" (snag when signup opens) or "notify" (text when a full class frees up)
     mode = data.get("mode", "autobook")
 
     entry = {
@@ -1332,10 +1297,8 @@ def api_book():
 
         success = _booking_succeeded(result)
         info = _find_cached_class(class_id, class_date) or {"class_id": class_id, "class_date": class_date}
-        emailed = send_booking_email(info, result, success, source="manual book",
-                                     quiet=True)
+        alert_booking(info, result, success, source="manual book", quiet=True)
         bump("booked" if success else "book_failed")
-        bump("emails_sent" if emailed else "emails_failed")
 
         append_log({
             "time": datetime.now().isoformat(),

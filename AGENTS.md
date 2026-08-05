@@ -41,7 +41,7 @@ Consequences worth knowing before you touch anything:
 - **A failed deploy texts you** through `imsg` (see below), because the box runs
   headless with a locked screen where a desktop notification draws to nobody.
 - **`api/.env` is not in git** and is never touched by a deploy: `MB*_EMAIL` /
-  `MB*_PASSWORD`, `SMTP_*`, `NOTIFY_EMAIL`, `IMSG_URL`. Every variable in it
+  `MB*_PASSWORD`, `IMSG_URL`. Every variable in it
   reaches the container via `env_file`, so a new knob needs no compose change.
 - **State lives in `~/.aerial-data`**, bind-mounted to `/data`: cookie jars,
   per-account watchlists, the booking log. The image is disposable; that
@@ -59,8 +59,8 @@ Consequences worth knowing before you touch anything:
 ## Alerts
 
 Everything the bot wants to tell you goes through `_notify()` in `api/app.py`:
-an email for the detail, an iMessage for the buzz. Do not call `_send_email`
-directly in new code.
+it prints the detail to stdout (so it lands in `docker logs`), and an iMessage
+for the buzz.
 
 The iMessage half is [`imsg`](https://github.com/Abhishek-More/imsg), a small
 shared service on the host (launchd `com.abhishek.imsg`, also used by
@@ -70,7 +70,7 @@ concierge). `IMSG_URL` in `api/.env` points at it:
 IMSG_URL=http://host.docker.internal:8779/<the imsg secret>
 ```
 
-Unset means the channel is off and only email fires, which is not an error.
+Unset means the channel is off — no alert reaches anyone, which is not an error.
 Host-side scripts use `127.0.0.1` instead of `host.docker.internal`.
 
 ## Checks
